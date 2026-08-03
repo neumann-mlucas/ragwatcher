@@ -169,9 +169,7 @@ class RagIndex:
                 plan.add.append(p)
                 continue
             st = p.stat()
-            fast_hit = (
-                not full and entry.mtime_ns == st.st_mtime_ns and entry.size == st.st_size
-            )
+            fast_hit = not full and entry.mtime_ns == st.st_mtime_ns and entry.size == st.st_size
             if fast_hit:
                 continue
             digest = sha256_file(p)
@@ -368,10 +366,7 @@ class RagIndex:
         # Truncate + min_score
         top = filtered[:k]
         if min_score is not None:
-            top = [
-                h for h in top
-                if rerank_scores.get(h.node.node_id, h.score or 0.0) >= min_score
-            ]
+            top = [h for h in top if rerank_scores.get(h.node.node_id, h.score or 0.0) >= min_score]
         stages["returned"] = len(top)
 
         returned: list[RetrievalHit] = []
@@ -399,7 +394,11 @@ class RagIndex:
 
         timings["total"] = int((time.monotonic() - t_all) * 1000)
         return RetrievalResult(
-            query=question, returned=returned, dropped=dropped_filter, stages=stages, timings_ms=timings
+            query=question,
+            returned=returned,
+            dropped=dropped_filter,
+            stages=stages,
+            timings_ms=timings,
         )
 
     def _bm25_retrieve(self, question: str, top_k: int) -> list[NodeWithScore]:

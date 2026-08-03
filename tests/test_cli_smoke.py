@@ -1,4 +1,5 @@
 """Smoke-test all subcommands with --help. No side effects."""
+
 from typer.testing import CliRunner
 
 from ragwatcher.cli import app

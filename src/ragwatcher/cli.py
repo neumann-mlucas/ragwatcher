@@ -57,9 +57,7 @@ def _root(
     log_level: Annotated[
         str | None, typer.Option("--log-level", help="debug|info|warn|error")
     ] = None,
-    log_format: Annotated[
-        str | None, typer.Option("--log-format", help="text|json")
-    ] = None,
+    log_format: Annotated[str | None, typer.Option("--log-format", help="text|json")] = None,
 ) -> None:
     overrides: dict[str, object] = {}
     if log_level:
@@ -192,7 +190,15 @@ def query(
                         "source": h.source,
                         "snippet": h.snippet,
                         "score": h.score,
-                        **({"scores": h.scores, "stage_survived": h.stage_survived, "neighbors": h.neighbors} if debug else {}),
+                        **(
+                            {
+                                "scores": h.scores,
+                                "stage_survived": h.stage_survived,
+                                "neighbors": h.neighbors,
+                            }
+                            if debug
+                            else {}
+                        ),
                     }
                     for h in result.returned
                 ],
@@ -299,7 +305,9 @@ def stats(
 
             from rich.live import Live
 
-            with Live(_render_stats(idx.stats(include_errors=errors)), refresh_per_second=1) as live:
+            with Live(
+                _render_stats(idx.stats(include_errors=errors)), refresh_per_second=1
+            ) as live:
                 while True:
                     _t.sleep(interval)
                     live.update(_render_stats(idx.stats(include_errors=errors)))

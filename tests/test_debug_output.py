@@ -1,4 +1,5 @@
 """Debug retrieval shape — locks A.15a schema."""
+
 from ragwatcher.index import RetrievalHit, RetrievalResult
 
 

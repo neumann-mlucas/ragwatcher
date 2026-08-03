@@ -153,9 +153,7 @@ def build_fingerprint(cfg: Any) -> dict[str, Any]:
         "chunk_semantic_breakpoint_percentile": (
             ch.semantic.breakpoint_percentile if semantic else None
         ),
-        "chunk_semantic_buffer_size": (
-            ch.semantic.buffer_size if semantic else None
-        ),
+        "chunk_semantic_buffer_size": (ch.semantic.buffer_size if semantic else None),
         "store_backend": cfg.store.backend,
         "context_enabled": ctx_enabled,
         "context_prompt_sha256": (

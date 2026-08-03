@@ -1,4 +1,5 @@
 """Reject stdout writes outside CLI JSON output or MCP frames."""
+
 import re
 from pathlib import Path
 

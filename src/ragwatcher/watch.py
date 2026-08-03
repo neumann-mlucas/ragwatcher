@@ -49,9 +49,7 @@ class Watcher:
         self._worker = threading.Thread(target=self._drain, daemon=True, name="rag-sync")
         self._worker.start()
         if self._rescan_interval > 0:
-            self._rescan = threading.Thread(
-                target=self._periodic, daemon=True, name="rag-rescan"
-            )
+            self._rescan = threading.Thread(target=self._periodic, daemon=True, name="rag-rescan")
             self._rescan.start()
         log.info("watch_started", extra={"dir": str(self.data_dir)})
 

@@ -67,7 +67,9 @@ class SimpleStore:
         if data is not None:
             embedding_dict = getattr(data, "embedding_dict", {})
             count = len(embedding_dict)
-        return StoreStats(backend=self.backend, node_count=count, persist_path=str(self._persist_dir))
+        return StoreStats(
+            backend=self.backend, node_count=count, persist_path=str(self._persist_dir)
+        )
 
     def clear(self) -> None:
         import shutil
@@ -133,7 +135,9 @@ class LanceStore:
                 count = int(tbl.count_rows())
         except Exception:
             count = 0
-        return StoreStats(backend=self.backend, node_count=count, persist_path=str(self._persist_dir))
+        return StoreStats(
+            backend=self.backend, node_count=count, persist_path=str(self._persist_dir)
+        )
 
     def clear(self) -> None:
         import shutil

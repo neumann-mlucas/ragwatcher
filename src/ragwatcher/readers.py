@@ -101,9 +101,7 @@ def _csv(path: Path) -> tuple[str, dict[str, Any]]:
         header = rows[0]
         lines = [", ".join(header)]
         for row in rows[1:]:
-            lines.append(
-                ", ".join(f"{h}={v}" for h, v in zip(header, row, strict=False))
-            )
+            lines.append(", ".join(f"{h}={v}" for h, v in zip(header, row, strict=False)))
         return "\n".join(lines), {"row_count": len(rows) - 1}
     except OSError as e:
         raise ReadError(f"csv read failed {path}: {e}") from e
