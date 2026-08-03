@@ -1,0 +1,8 @@
+{
+  "project": "ragwatcher",
+  "goals": ["local RAG", "incremental", "MCP tool"],
+  "meta": {
+    "language": "python",
+    "min_version": "3.11"
+  }
+}

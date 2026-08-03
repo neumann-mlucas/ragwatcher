@@ -7,4 +7,52 @@ license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "neumann-mlucas", email = "neumann.m.lucas@gmail.com" }]
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "llama-index-core>=0.11",
+    "llama-index-embeddings-fastembed>=0.2",
+    "llama-index-readers-file>=0.2",
+    "llama-index-retrievers-bm25>=0.4",
+    "fastembed>=0.4",
+    "mcp>=2.0,<3",
+    "watchdog>=4",
+    "pypdf>=4",
+    "python-docx>=1",
+    "EbookLib>=0.18",
+    "html2text>=2024",
+    "typer>=0.12",
+    "pydantic-settings>=2.4",
+    "rich>=13",
+    "structlog>=24",
+    "platformdirs>=4",
+    "filelock>=3.15",
+]
+
+[project.optional-dependencies]
+pdf-pro = ["pymupdf>=1.24"]
+remote = ["qdrant-client>=1.11", "openai>=1.40", "cohere>=5"]
+lance = ["llama-index-vector-stores-lancedb>=0.5"]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=5",
+    "ruff>=0.6",
+    "mypy>=1.11",
+]
+
+[project.scripts]
+ragwatcher = "ragwatcher.cli:app"
+
+[tool.pytest.ini_options]
+markers = ["slow: integration test using real embed model"]
+addopts = "-ra -q"
+testpaths = ["tests"]
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ragwatcher"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/ragwatcher", "README.md", "LICENSE", "pyproject.toml"]

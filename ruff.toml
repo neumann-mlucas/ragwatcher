@@ -1,0 +1,34 @@
+line-length = 100
+target-version = "py311"
+
+[lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "N", "PLC", "PLE", "PLW", "TRY"]
+ignore = [
+    "TRY003",
+    "PLW0603",
+    "PLC0415",
+    "PLW0108",
+    "BLE001",
+    "TRY400",
+    "TRY300",
+    "TRY301",
+    "TRY401",
+    "N815",
+    "E501",
+    "SIM103",
+    "SIM108",
+    "SIM102",
+    "SIM117",
+    "N818",
+    "B904",
+    "RUF100",
+    "UP035",
+    "UP007",
+    "UP045",
+]
+
+[lint.per-file-ignores]
+"tests/*" = ["PLC0415", "PLR2004"]
+
+[format]
+quote-style = "double"

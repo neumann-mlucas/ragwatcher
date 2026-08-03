@@ -1,0 +1,58 @@
+name: ci
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  schedule:
+    - cron: "17 5 * * *"
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - name: Install
+        run: uv sync --extra dev
+      - name: Ruff
+        run: uv run ruff check src tests
+      - name: Ruff format
+        run: uv run ruff format --check src tests
+      - name: Mypy
+        run: uv run mypy src
+
+  unit:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - name: Install
+        run: uv sync --extra dev --python ${{ matrix.python }}
+      - name: Test
+        run: uv run pytest -q --ignore=tests/integration
+
+  integration:
+    if: github.event_name == 'schedule' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - name: Cache fastembed models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ragwatcher/models
+          key: fastembed-bge-small-en-v1.5
+      - name: Install
+        run: uv sync --extra dev
+      - name: Integration
+        run: uv run pytest tests/integration -q -m slow

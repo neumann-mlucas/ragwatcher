@@ -8,3 +8,15 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Ruff / mypy
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+
+# uv lock kept in-tree; caches ignored
+.uv/
+
+# Local ragwatcher state
+.rag_index/
+
