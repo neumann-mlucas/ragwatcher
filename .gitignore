@@ -20,3 +20,7 @@ wheels/
 # Local ragwatcher state
 .rag_index/
 
+# Coverage
+.coverage
+htmlcov/
+
