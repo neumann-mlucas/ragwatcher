@@ -358,6 +358,7 @@ Order (file by file, one commit each):
 - Qdrant + remote embed/rerank via `[remote]` extra.
 - Tree-sitter code splitter via `[code]` extra.
 - OpenTelemetry (only if requested).
+- Concurrency (batch embed, RW lock, LanceStore default) — see Part C, P6.
 
 ---
 
@@ -437,6 +438,53 @@ Legend: `[ ]` open, `[~]` blocked, `[x]` done. Prefixed w/ phase.
 - [ ] Qdrant backend + `[remote]` extra.
 - [ ] Tree-sitter code splitter + `[code]` extra.
 - [ ] API embed/rerank backends.
+
+### P6 — Concurrency (backlog, motivated by multi-Claude-session use)
+
+**Problem.** `RagIndex` takes an exclusive `filelock.FileLock` in `__enter__`
+(`index.py:84`), so a second `ragwatcher serve` blocks on the lock. The
+recommended workaround today is one shared HTTP server; P6 makes the lock
+model itself concurrent-friendly and speeds up sync.
+
+Do the items in order — each stops paying if the previous made the workload
+fast/safe enough. YAGNI applies.
+
+- [ ] P6.1 **Batch embed in `sync()`.** Biggest win, no threads. Collect
+      nodes from all files in the plan, call `embed_model.get_text_embedding_batch(texts)`
+      once (or in chunks of N), then hand results to `vector_store.add`.
+      Rewrite `_embed_file` to *stage* nodes; flush after the file loop in
+      `sync()`. Manifest entries written after the flush. FastEmbed already
+      parallelizes over CPU inside a batch, so single-thread is enough.
+- [ ] P6.2 **RW lock (reader / writer).** Replace `filelock.FileLock` with
+      `fcntl.flock(LOCK_SH | LOCK_EX)` (stdlib) or the `readerwriterlock`
+      package. `retrieve()` acquires shared, `sync()` acquires exclusive.
+      Update `LockHeld` semantics: still raised when a writer holds; readers
+      never see it against other readers. Enables N concurrent stdio Claude
+      sessions to `query`. Requires proving `SimpleVectorStore.query` is
+      read-only and safe (it is — read of dict).
+- [ ] P6.3 **LanceStore as default backend.** Stub exists at `store.py:92`.
+      LanceDB is transactional (MVCC), so concurrent readers + a single
+      writer are safe without app-level locking around the store. Migrate
+      `store.default` to `lance`, keep `simple` as a zero-dep fallback.
+      Manifest fingerprint bump forces re-embed.
+- [ ] P6.4 **Thread pool for read + chunk stage.** Only after P6.1 measures
+      as read-bound. `ThreadPoolExecutor(os.cpu_count())` runs
+      `readers.read` + `splitter.get_nodes_from_documents` in parallel;
+      results feed a single embed thread that drains a queue in batches.
+      Needs a `threading.Lock` around `self.manifest.files[...] =` writes.
+- [ ] P6.5 **BM25 lazy init race.** `index.py:410-416` — guard `self._bm25`
+      construction with a `threading.Lock` (or build eagerly once at first
+      sync).
+- [ ] P6.6 **`LISettings` audit.** Global mutable in `index.py:110`. If P6.4
+      lands, prove that no thread mutates `LISettings.embed_model` mid-run
+      (currently only `_open()` writes it, once per process — should be OK).
+- [ ] P6.7 **Bench + test.** Add `scripts/bench_concurrency.py`: N reader
+      threads doing `retrieve` while one writer runs `sync`. Assert no
+      `LockHeld`, no torn state, throughput scales.
+
+**Non-goals for P6.** Multi-process writers, distributed indexing,
+async-all-the-way through `index.py` (still sync — SPEC F.12 stands, only
+FastMCP is async).
 
 ---
 
