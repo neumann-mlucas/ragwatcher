@@ -92,12 +92,16 @@ class RagIndex:
         self.close()
 
     def close(self) -> None:
+        persist_ok = True
         if self.store is not None:
             try:
                 self.store.persist()
             except StoreError as e:
+                persist_ok = False
                 log.warning("persist_failed", extra={"err": str(e)})
-        if self.manifest is not None:
+        # Only save manifest if store persist succeeded — otherwise manifest
+        # would claim files that aren't actually in the vector store.
+        if self.manifest is not None and persist_ok:
             manifest.save(self.persist_dir / "manifest.json", self.manifest)
         if self._locked:
             self._lock.release()
@@ -119,6 +123,17 @@ class RagIndex:
         else:
             m.check_fingerprint(fp)  # raises SchemaMismatch on drift
             self.manifest = m
+
+        # Recovery: if manifest claims chunks but vector store is empty,
+        # the store was clobbered (see _check_store_invariant). Reset the
+        # manifest so the next sync re-embeds instead of no-op-ing on mtime.
+        expected = sum(e.chunk_count for e in self.manifest.files.values())
+        if expected > 0 and self.store.stats().node_count == 0:
+            log.warning(
+                "store_empty_reset_manifest",
+                extra={"expected_chunks": expected, "persist_dir": str(self.persist_dir)},
+            )
+            self.manifest = Manifest.new(fp)
 
     # ---------------- sync ----------------
 
@@ -151,8 +166,11 @@ class RagIndex:
             self._delete_file(path_str)
 
         if plan.add or plan.update or plan.delete:
-            manifest.save(self.persist_dir / "manifest.json", self.manifest)
+            # Persist store first, then save manifest — so manifest never
+            # references doc_ids that failed to reach the vector store.
             self.store.persist()
+            self._check_store_invariant()
+            manifest.save(self.persist_dir / "manifest.json", self.manifest)
             self._reset_retriever()
 
         return SyncResult(plan=plan, errors=errors, duration_ms=int((time.monotonic() - t0) * 1000))
@@ -303,6 +321,25 @@ class RagIndex:
     def _reset_retriever(self) -> None:
         # Force rebuild w/ new nodes
         pass
+
+    def _check_store_invariant(self) -> None:
+        """Loud failure if manifest claims chunks but store is empty.
+
+        Guards against the historical bug where SimpleStore.persist wrote
+        an empty vector_store.json while the manifest recorded thousands
+        of doc_ids — leaving `query` silently returning no results.
+        """
+        assert self.store is not None and self.manifest is not None
+        expected = sum(e.chunk_count for e in self.manifest.files.values())
+        if expected == 0:
+            return
+        got = self.store.stats().node_count
+        if got == 0:
+            raise StoreError(
+                f"store invariant violated: manifest claims {expected} chunks "
+                f"but vector store has 0 nodes after persist "
+                f"(persist_dir={self.persist_dir})"
+            )
 
     def retrieve(
         self,
