@@ -8,7 +8,7 @@ def test_defaults_load_offline():
     s = Settings()
     assert s.embed.model.startswith("BAAI/")
     assert s.chunk.strategy == "recursive"
-    assert s.store.backend == "simple"
+    assert s.store.backend == "lance"
 
 
 def test_per_dir_toml_overrides(tmp_path: Path, monkeypatch):

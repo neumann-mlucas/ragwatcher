@@ -12,6 +12,7 @@ dependencies = [
     "llama-index-embeddings-fastembed>=0.2",
     "llama-index-readers-file>=0.2",
     "llama-index-retrievers-bm25>=0.4",
+    "llama-index-vector-stores-lancedb>=0.5",
     "fastembed>=0.4",
     "mcp>=2.0,<3",
     "watchdog>=4",
@@ -30,7 +31,6 @@ dependencies = [
 [project.optional-dependencies]
 pdf-pro = ["pymupdf>=1.24"]
 remote = ["qdrant-client>=1.11", "openai>=1.40", "cohere>=5"]
-lance = ["llama-index-vector-stores-lancedb>=0.5"]
 dev = [
     "pytest>=8",
     "pytest-asyncio>=0.23",

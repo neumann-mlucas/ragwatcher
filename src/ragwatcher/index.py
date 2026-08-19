@@ -92,15 +92,17 @@ class RagIndex:
         self.close()
 
     def close(self) -> None:
+        # sync() already persists + saves manifest under the invariant guard.
+        # close() persists again to catch mutations outside sync (none today),
+        # but only writes the manifest if the invariant still holds.
         persist_ok = True
         if self.store is not None:
             try:
                 self.store.persist()
+                self._check_store_invariant()
             except StoreError as e:
                 persist_ok = False
                 log.warning("persist_failed", extra={"err": str(e)})
-        # Only save manifest if store persist succeeded — otherwise manifest
-        # would claim files that aren't actually in the vector store.
         if self.manifest is not None and persist_ok:
             manifest.save(self.persist_dir / "manifest.json", self.manifest)
         if self._locked:
@@ -124,11 +126,11 @@ class RagIndex:
             m.check_fingerprint(fp)  # raises SchemaMismatch on drift
             self.manifest = m
 
-        # Recovery: if manifest claims chunks but vector store is empty,
-        # the store was clobbered (see _check_store_invariant). Reset the
-        # manifest so the next sync re-embeds instead of no-op-ing on mtime.
+        # Recovery: if manifest claims chunks but vector store is empty on
+        # disk, the store was clobbered. Reset the manifest so the next sync
+        # re-embeds instead of no-op-ing on mtime.
         expected = sum(e.chunk_count for e in self.manifest.files.values())
-        if expected > 0 and self.store.stats().node_count == 0:
+        if expected > 0 and self.store.persisted_node_count() == 0:
             log.warning(
                 "store_empty_reset_manifest",
                 extra={"expected_chunks": expected, "persist_dir": str(self.persist_dir)},
@@ -306,16 +308,27 @@ class RagIndex:
 
     def _ensure_retriever(self) -> Any:
         assert self.store is not None
-        if self._index_obj is None:
-            from llama_index.core import load_index_from_storage
+        if self._index_obj is not None:
+            return self._index_obj
 
-            ctx = self.store.storage_context()
-            try:
-                self._index_obj = load_index_from_storage(ctx)
-            except (ValueError, KeyError):
-                # Empty store — build a stub index from the docstore nodes
-                nodes = list(ctx.docstore.docs.values())
-                self._index_obj = VectorStoreIndex(nodes=nodes, storage_context=ctx)
+        from llama_index.core import load_index_from_storage
+
+        ctx = self.store.storage_context()
+
+        # Empty store → build an empty index bound to the storage context.
+        # Do NOT feed docstore nodes here: that path silently re-embeds
+        # everything and hides real load failures.
+        if self.store.persisted_node_count() == 0:
+            self._index_obj = VectorStoreIndex(nodes=[], storage_context=ctx)
+            return self._index_obj
+
+        try:
+            self._index_obj = load_index_from_storage(ctx)
+        except (ValueError, KeyError) as e:
+            raise StoreError(
+                f"failed to load index from {self.persist_dir}: {e}. "
+                "Run `ragwatcher index --full` to rebuild."
+            ) from e
         return self._index_obj
 
     def _reset_retriever(self) -> None:
@@ -323,21 +336,21 @@ class RagIndex:
         pass
 
     def _check_store_invariant(self) -> None:
-        """Loud failure if manifest claims chunks but store is empty.
+        """Loud failure if manifest claims chunks but store is empty *on disk*.
 
-        Guards against the historical bug where SimpleStore.persist wrote
-        an empty vector_store.json while the manifest recorded thousands
-        of doc_ids — leaving `query` silently returning no results.
+        Uses persisted_node_count (not in-memory stats) — the original
+        SimpleStore bug produced healthy-looking in-memory counts while
+        persist silently wrote a 0-byte vector_store.json.
         """
         assert self.store is not None and self.manifest is not None
         expected = sum(e.chunk_count for e in self.manifest.files.values())
         if expected == 0:
             return
-        got = self.store.stats().node_count
+        got = self.store.persisted_node_count()
         if got == 0:
             raise StoreError(
                 f"store invariant violated: manifest claims {expected} chunks "
-                f"but vector store has 0 nodes after persist "
+                f"but persisted vector store has 0 nodes "
                 f"(persist_dir={self.persist_dir})"
             )
 

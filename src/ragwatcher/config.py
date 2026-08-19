@@ -52,7 +52,7 @@ class RetrieveCfg(BaseModel):
 
 
 class StoreCfg(BaseModel):
-    backend: Literal["lance", "simple", "qdrant"] = "simple"
+    backend: Literal["lance", "simple", "qdrant"] = "lance"
     path: str = ".rag_index"
 
 

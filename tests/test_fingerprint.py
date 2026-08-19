@@ -25,7 +25,7 @@ PINNED_MUTATIONS = [
     ("chunk_size", {"chunk": {"size": 999}}),
     ("chunk_overlap", {"chunk": {"overlap": 999}}),
     ("chunk_strategy", {"chunk": {"strategy": "semantic"}}),
-    ("store_backend", {"store": {"backend": "lance"}}),
+    ("store_backend", {"store": {"backend": "simple"}}),
 ]
 
 

@@ -3292,6 +3292,7 @@ dependencies = [
     { name = "llama-index-embeddings-fastembed" },
     { name = "llama-index-readers-file" },
     { name = "llama-index-retrievers-bm25" },
+    { name = "llama-index-vector-stores-lancedb" },
     { name = "mcp" },
     { name = "platformdirs" },
     { name = "pydantic-settings" },
@@ -3310,9 +3311,6 @@ dev = [
     { name = "pytest-asyncio" },
     { name = "pytest-cov" },
     { name = "ruff" },
-]
-lance = [
-    { name = "llama-index-vector-stores-lancedb" },
 ]
 pdf-pro = [
     { name = "pymupdf" },
@@ -3334,7 +3332,7 @@ requires-dist = [
     { name = "llama-index-embeddings-fastembed", specifier = ">=0.2" },
     { name = "llama-index-readers-file", specifier = ">=0.2" },
     { name = "llama-index-retrievers-bm25", specifier = ">=0.4" },
-    { name = "llama-index-vector-stores-lancedb", marker = "extra == 'lance'", specifier = ">=0.5" },
+    { name = "llama-index-vector-stores-lancedb", specifier = ">=0.5" },
     { name = "mcp", specifier = ">=2.0,<3" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.11" },
     { name = "openai", marker = "extra == 'remote'", specifier = ">=1.40" },
@@ -3353,7 +3351,7 @@ requires-dist = [
     { name = "typer", specifier = ">=0.12" },
     { name = "watchdog", specifier = ">=4" },
 ]
-provides-extras = ["pdf-pro", "remote", "lance", "dev"]
+provides-extras = ["pdf-pro", "remote", "dev"]
 
 [[package]]
 name = "referencing"
