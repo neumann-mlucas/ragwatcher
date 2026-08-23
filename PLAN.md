@@ -359,6 +359,10 @@ Order (file by file, one commit each):
 - Tree-sitter code splitter via `[code]` extra.
 - OpenTelemetry (only if requested).
 - Concurrency (batch embed, RW lock, LanceStore default) — see Part C, P6.
+- `[pdf-pro]` pymupdf fallback in `readers.py`: try pymupdf first (tolerates
+  malformed pdfs — `incorrect startxref`, escaped-string parse errors that
+  pypdf treats as fatal), fall back to pypdf. Route pypdf's stderr warnings
+  through a `pypdf` logger namespace so noisy files don't spam the root log.
 
 ---
 

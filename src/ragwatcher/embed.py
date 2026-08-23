@@ -19,8 +19,7 @@ def cache_dir() -> str:
 def _make(model: str, dim: int | None) -> object:
     from llama_index.embeddings.fastembed import FastEmbedEmbedding
 
-    kwargs: dict[str, object] = {"model_name": model, "cache_dir": _CACHE_DIR}
-    return FastEmbedEmbedding(**kwargs)
+    return FastEmbedEmbedding(model_name=model, cache_dir=_CACHE_DIR)
 
 
 def get_embedding(cfg: object) -> object:
