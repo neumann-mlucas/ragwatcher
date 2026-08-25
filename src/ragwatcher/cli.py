@@ -73,6 +73,13 @@ def _setup_logging(settings: Settings) -> None:
 
 
 def _open_index(data_dir: Path) -> RagIndex:
+    """Build + enter a RagIndex, mapping open-time failures to CLI exit codes.
+
+    Callers own the returned index and MUST `try/finally: idx.close()` — or
+    use `_open_index` inside a `with contextlib.closing(...)` block.
+    Bypassing `with` here is safe: RagIndex.__enter__ acquires no resource
+    before `_open()`, so a raised SchemaMismatch leaks nothing.
+    """
     settings = _resolve_settings(data_dir)
     _setup_logging(settings)
     try:

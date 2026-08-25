@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from ragwatcher.config import StoreCfg
 from ragwatcher.errors import StoreError
@@ -127,6 +127,9 @@ class LanceStore:
         persist_dir.mkdir(parents=True, exist_ok=True)
         self._lance_dir = persist_dir / "lance"
         self._vs = LanceDBVectorStore(uri=str(self._lance_dir), table_name="chunks")
+        # Cached read-only lancedb connection used before the vector store has
+        # opened its own table (first-process-open path in _count_rows).
+        self._ro_conn: Any = None
         try:
             self._ctx = StorageContext.from_defaults(
                 persist_dir=str(persist_dir), vector_store=self._vs
@@ -160,21 +163,23 @@ class LanceStore:
 
     def _count_rows(self) -> int:
         tbl = getattr(self._vs, "_table", None)
-        if tbl is None:
-            # Table not opened yet (no inserts this process): peek at the dir.
-            if not self._lance_dir.exists():
-                return 0
-            try:
+        if tbl is not None:
+            return int(tbl.count_rows())
+        # Table not opened yet (no inserts this process): peek at the dir.
+        if not self._lance_dir.exists():
+            return 0
+        try:
+            if self._ro_conn is None:
                 import lancedb  # type: ignore[import-untyped]
 
-                db = lancedb.connect(str(self._lance_dir))
-                names = db.list_tables() if hasattr(db, "list_tables") else db.table_names()
-                if "chunks" not in names:
-                    return 0
-                return int(db.open_table("chunks").count_rows())
-            except ImportError:
-                return 0
-        return int(tbl.count_rows())
+                self._ro_conn = lancedb.connect(str(self._lance_dir))
+        except ImportError:
+            return 0
+        db = self._ro_conn
+        names = db.list_tables() if hasattr(db, "list_tables") else db.table_names()
+        if "chunks" not in names:
+            return 0
+        return int(db.open_table("chunks").count_rows())
 
     def clear(self) -> None:
         import shutil
