@@ -161,6 +161,11 @@ class RagIndex:
         self._index_obj: Any = None
         self._bm25: Any = None
         self._bm25_lock = threading.Lock()
+        # Flipped by sync() when a write phase actually runs. close() uses
+        # this to skip the exclusive-lock persist on read-only sessions —
+        # otherwise readers would stall up to _EXCLUSIVE_TIMEOUT_SEC waiting
+        # on a competing writer just to redo work sync() already did.
+        self._dirty = False
 
     def __enter__(self) -> RagIndex:
         self._lock.acquire_shared()
@@ -171,28 +176,25 @@ class RagIndex:
         self.close()
 
     def close(self) -> None:
-        # sync() already persists + saves manifest under the invariant guard.
-        # close() persists again to catch mutations outside sync (none today),
-        # but only writes the manifest if the invariant still holds. Take the
-        # writer lock here too — under the multi-reader semantics introduced
-        # by P6.2, concurrent closes would otherwise race on manifest.json.
-        persist_ok = True
+        # sync() already persists + saves manifest under the exclusive lock.
+        # Only re-persist here if this session actually mutated state; a
+        # read-only session must not contend for the writer lock (would stall
+        # up to _EXCLUSIVE_TIMEOUT_SEC against a live writer).
         try:
-            with self._write_lock, self._lock.exclusive():
-                if self.store is not None:
-                    try:
-                        self.store.persist()
-                        self._check_store_invariant()
-                    except StoreError as e:
-                        persist_ok = False
-                        log.warning("persist_failed", extra={"err": str(e)})
-                if self.manifest is not None and persist_ok:
-                    manifest.save(self.persist_dir / "manifest.json", self.manifest)
-        except LockHeld:
-            # Another writer is stuck holding exclusive; skip persist rather
-            # than block close indefinitely. sync() already wrote the latest
-            # good state; losing the redundant close-write is acceptable.
-            log.warning("close_persist_skipped_lock_timeout")
+            if self._dirty:
+                try:
+                    with self._write_lock, self._lock.exclusive():
+                        assert self.store is not None and self.manifest is not None
+                        try:
+                            self.store.persist()
+                            self._check_store_invariant()
+                            manifest.save(self.persist_dir / "manifest.json", self.manifest)
+                        except StoreError as e:
+                            log.warning("persist_failed", extra={"err": str(e)})
+                except LockHeld:
+                    # Another writer holds exclusive; sync() already wrote the
+                    # latest good state, losing this redundant re-persist is OK.
+                    log.warning("close_persist_skipped_lock_timeout")
         finally:
             self._lock.release()
 
@@ -248,7 +250,7 @@ class RagIndex:
                 s = self._stage_file(p)
                 if s is not None:
                     staged.append(s)
-            except (ReadError, EmbedError, StoreError) as e:
+            except ReadError as e:
                 errors[str(p)] = str(e)
                 self._record_error(p, e)
                 log.warning("file_failed", extra={"file": str(p), "err": str(e)})
@@ -277,6 +279,10 @@ class RagIndex:
                     else:
                         self._index_obj.insert_nodes(all_nodes)
                 except Exception as e:
+                    # Roll back any partially inserted nodes so the store never
+                    # holds orphans that would trip _check_store_invariant.
+                    # Node IDs are stable, delete-by-id is idempotent.
+                    self._delete_doc_ids([n.node_id for n in all_nodes])
                     # ponytail: batch-or-nothing on embed failure; add per-file
                     # fallback if a bad chunk starts killing whole syncs in practice.
                     for p, _nodes, _entry in staged:
@@ -310,6 +316,7 @@ class RagIndex:
                 self._check_store_invariant()
                 manifest.save(self.persist_dir / "manifest.json", self.manifest)
                 self._reset_retriever()
+                self._dirty = True
 
         return SyncResult(plan=plan, errors=errors, duration_ms=int((time.monotonic() - t0) * 1000))
 

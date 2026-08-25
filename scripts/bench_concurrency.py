@@ -10,6 +10,7 @@ Asserts:
 
 from __future__ import annotations
 
+import os
 import shutil
 import statistics
 import tempfile
@@ -28,12 +29,12 @@ WRITER_ITERS = 3
 
 
 def _reader(idx: RagIndex, done: threading.Event, latencies: list[float]) -> None:
-    while not done.is_set():
-        for _ in range(READS_PER_THREAD):
-            t0 = time.monotonic()
-            idx.retrieve("alpha", top_k=3)
-            latencies.append((time.monotonic() - t0) * 1000)
-        break
+    for _ in range(READS_PER_THREAD):
+        if done.is_set():
+            return
+        t0 = time.monotonic()
+        idx.retrieve("alpha", top_k=3)
+        latencies.append((time.monotonic() - t0) * 1000)
 
 
 def _writer(idx: RagIndex, tmp_dir: Path) -> int:
@@ -45,8 +46,6 @@ def _writer(idx: RagIndex, tmp_dir: Path) -> int:
         touched.write_text(f"# churn {i}\nnew content number {i}\n")
         # Bust the mtime fast-path even inside the same second.
         st = touched.stat()
-        import os
-
         os.utime(touched, ns=(st.st_atime_ns, st.st_mtime_ns + 1))
         idx.sync()
     return WRITER_ITERS
