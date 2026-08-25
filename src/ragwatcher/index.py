@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import fnmatch
+import os
+import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -11,7 +14,7 @@ from typing import Any
 from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
 from llama_index.core import Document, VectorStoreIndex
-from llama_index.core.schema import NodeWithScore
+from llama_index.core.schema import BaseNode, NodeWithScore
 
 from ragwatcher import chunking, embed, manifest, readers
 from ragwatcher.config import Settings
@@ -65,26 +68,102 @@ class RetrievalResult:
     timings_ms: dict[str, int]
 
 
+class _RWLock:
+    """Cross-process writer lock. Readers don't lock — the underlying store
+    (LanceDB) is transactional; SimpleStore reads are dict snapshots.
+
+    `exclusive()` serializes syncs across processes: one writer at a time.
+    Blocks up to `_EXCLUSIVE_TIMEOUT_SEC` waiting for a competing writer,
+    then raises LockHeld.
+
+    Windows fallback: `filelock.FileLock`. Unix: stdlib `fcntl.flock`.
+
+    Named _RWLock for parity with earlier PLAN naming; reader side is a
+    no-op because readers never contend with each other and don't need to
+    block writers (writers just quickly grab exclusive during commits).
+    """
+
+    _EXCLUSIVE_TIMEOUT_SEC = 60.0
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    def acquire_shared(self) -> None:
+        # No-op: reader side is unlocked. Path exists so `close()` works
+        # uniformly and the lock file is created for the writer to open.
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.path.exists():
+            self.path.touch()
+
+    def release(self) -> None:
+        # No shared state to release; writers manage their own lifetime.
+        return
+
+    def exclusive(self) -> Any:
+        return _ExclusiveScope(self)
+
+
+class _ExclusiveScope:
+    def __init__(self, lock: _RWLock) -> None:
+        self._lock = lock
+        self._fd: int | None = None
+        self._fallback: FileLock | None = None
+
+    def __enter__(self) -> None:
+        if sys.platform.startswith("win"):
+            self._fallback = FileLock(str(self._lock.path))
+            try:
+                self._fallback.acquire(timeout=_RWLock._EXCLUSIVE_TIMEOUT_SEC)
+            except FileLockTimeout as e:
+                raise LockHeld(str(self._lock.path)) from e
+            return
+        import fcntl
+
+        self._fd = os.open(str(self._lock.path), os.O_CREAT | os.O_RDWR, 0o644)
+        deadline = time.monotonic() + _RWLock._EXCLUSIVE_TIMEOUT_SEC
+        while True:
+            try:
+                fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return
+            except BlockingIOError as e:
+                if time.monotonic() >= deadline:
+                    os.close(self._fd)
+                    self._fd = None
+                    raise LockHeld(str(self._lock.path)) from e
+                time.sleep(0.05)
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        if self._fallback is not None:
+            self._fallback.release()
+            self._fallback = None
+        elif self._fd is not None:
+            import fcntl
+
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+            os.close(self._fd)
+            self._fd = None
+
+
 class RagIndex:
     def __init__(self, data_dir: Path, config: Settings) -> None:
         self.data_dir = data_dir.resolve()
         self.config = config
         self.persist_dir = self.data_dir / config.store.path
         self.persist_dir.mkdir(parents=True, exist_ok=True)
-        self._lock = FileLock(str(self.persist_dir / "lock"))
-        self._locked = False
+        # Shared/exclusive lock: many readers coexist; sync() upgrades to
+        # exclusive around the write phase. Windows falls back to a single
+        # exclusive filelock (same file, same LockHeld semantics on contention).
+        self._lock = _RWLock(self.persist_dir / "lock")
+        self._write_lock = threading.Lock()  # in-process serialization for sync()
         self.store: Store | None = None
         self.manifest: Manifest | None = None
         self._reranker = Reranker(config.rerank)
         self._index_obj: Any = None
         self._bm25: Any = None
+        self._bm25_lock = threading.Lock()
 
     def __enter__(self) -> RagIndex:
-        try:
-            self._lock.acquire(timeout=0)
-            self._locked = True
-        except FileLockTimeout as e:
-            raise LockHeld(str(self.persist_dir / "lock")) from e
+        self._lock.acquire_shared()
         self._open()
         return self
 
@@ -94,20 +173,28 @@ class RagIndex:
     def close(self) -> None:
         # sync() already persists + saves manifest under the invariant guard.
         # close() persists again to catch mutations outside sync (none today),
-        # but only writes the manifest if the invariant still holds.
+        # but only writes the manifest if the invariant still holds. Take the
+        # writer lock here too — under the multi-reader semantics introduced
+        # by P6.2, concurrent closes would otherwise race on manifest.json.
         persist_ok = True
-        if self.store is not None:
-            try:
-                self.store.persist()
-                self._check_store_invariant()
-            except StoreError as e:
-                persist_ok = False
-                log.warning("persist_failed", extra={"err": str(e)})
-        if self.manifest is not None and persist_ok:
-            manifest.save(self.persist_dir / "manifest.json", self.manifest)
-        if self._locked:
+        try:
+            with self._write_lock, self._lock.exclusive():
+                if self.store is not None:
+                    try:
+                        self.store.persist()
+                        self._check_store_invariant()
+                    except StoreError as e:
+                        persist_ok = False
+                        log.warning("persist_failed", extra={"err": str(e)})
+                if self.manifest is not None and persist_ok:
+                    manifest.save(self.persist_dir / "manifest.json", self.manifest)
+        except LockHeld:
+            # Another writer is stuck holding exclusive; skip persist rather
+            # than block close indefinitely. sync() already wrote the latest
+            # good state; losing the redundant close-write is acceptable.
+            log.warning("close_persist_skipped_lock_timeout")
+        finally:
             self._lock.release()
-            self._locked = False
 
     def _open(self) -> None:
         from llama_index.core import Settings as LISettings
@@ -152,9 +239,15 @@ class RagIndex:
 
         targets = plan.add + plan.update
         progress = _maybe_progress(len(targets)) if show_progress else None
+
+        # Stage 1: read + chunk every file. No embed yet — per-file errors here
+        # never poison the shared embed batch.
+        staged: list[tuple[Path, list[BaseNode], FileEntry]] = []
         for p in targets:
             try:
-                self._embed_file(p)
+                s = self._stage_file(p)
+                if s is not None:
+                    staged.append(s)
             except (ReadError, EmbedError, StoreError) as e:
                 errors[str(p)] = str(e)
                 self._record_error(p, e)
@@ -164,16 +257,59 @@ class RagIndex:
         if progress:
             progress[0].stop()
 
-        for path_str in plan.delete:
-            self._delete_file(path_str)
+        # Write phase — serialize across processes (cross-proc exclusive
+        # upgrade) and threads (in-process lock). Everything below mutates
+        # store + manifest; readers must not observe torn state.
+        with self._write_lock, self._lock.exclusive():
+            # Stage 2: single batch embed + insert. New nodes go in FIRST so a
+            # batch failure leaves the previous chunks intact (delete happens
+            # only after the insert succeeds). FastEmbed batches internally
+            # (config.embed.batch_size); one call amortizes overhead across files.
+            insert_ok = True
+            if staged:
+                all_nodes = [n for _, nodes, _ in staged for n in nodes]
+                try:
+                    if self._index_obj is None:
+                        self._index_obj = VectorStoreIndex(
+                            nodes=all_nodes,
+                            storage_context=self.store.storage_context(),
+                        )
+                    else:
+                        self._index_obj.insert_nodes(all_nodes)
+                except Exception as e:
+                    # ponytail: batch-or-nothing on embed failure; add per-file
+                    # fallback if a bad chunk starts killing whole syncs in practice.
+                    for p, _nodes, _entry in staged:
+                        errors[str(p)] = f"batch embed failed: {e}"
+                        self._record_error(p, EmbedError(str(e)))
+                    log.warning("batch_embed_failed", extra={"err": str(e), "files": len(staged)})
+                    insert_ok = False
+                    staged = []
 
-        if plan.add or plan.update or plan.delete:
-            # Persist store first, then save manifest — so manifest never
-            # references doc_ids that failed to reach the vector store.
-            self.store.persist()
-            self._check_store_invariant()
-            manifest.save(self.persist_dir / "manifest.json", self.manifest)
-            self._reset_retriever()
+            # Stage 3: drop the previous chunks for updates now that new ones
+            # are safely in the store. Skipped when the batch failed — the old
+            # chunks remain the only copy and the manifest still points to them.
+            if insert_ok:
+                for p, _nodes, _entry in staged:
+                    old = self.manifest.files.get(str(p))
+                    if old and old.doc_ids:
+                        self._delete_doc_ids(old.doc_ids)
+
+            # Stage 4: manifest write for successfully embedded files.
+            for p, nodes, entry in staged:
+                self.manifest.files[str(p)] = entry
+                log.info("file_embedded", extra={"file": str(p), "chunks": len(nodes)})
+
+            for path_str in plan.delete:
+                self._delete_file(path_str)
+
+            if plan.add or plan.update or plan.delete:
+                # Persist store first, then save manifest — so manifest never
+                # references doc_ids that failed to reach the vector store.
+                self.store.persist()
+                self._check_store_invariant()
+                manifest.save(self.persist_dir / "manifest.json", self.manifest)
+                self._reset_retriever()
 
         return SyncResult(plan=plan, errors=errors, duration_ms=int((time.monotonic() - t0) * 1000))
 
@@ -226,11 +362,15 @@ class RagIndex:
             out.append(path)
         return out
 
-    def _embed_file(self, path: Path) -> None:
-        assert self.store is not None and self.manifest is not None
+    def _stage_file(self, path: Path) -> tuple[Path, list[BaseNode], FileEntry] | None:
+        """Read+chunk one file, returning nodes + a preliminary manifest entry.
+
+        No embed here — the batch embed happens once per sync so FastEmbed can
+        pack many files into each backend call.
+        """
         text, meta = readers.read(path)
         if not text.strip():
-            return
+            return None
         st = path.stat()
         digest = sha256_file(path)
         base_meta = {
@@ -250,33 +390,16 @@ class RagIndex:
         for n in nodes:
             n.metadata.update(base_meta)
 
-        # Delete old chunks first (update path)
-        old_entry = self.manifest.files.get(str(path))
-        if old_entry and old_entry.doc_ids:
-            self._delete_doc_ids(old_entry.doc_ids)
-
-        try:
-            if self._index_obj is None:
-                self._index_obj = VectorStoreIndex(
-                    nodes=nodes,
-                    storage_context=self.store.storage_context(),
-                )
-            else:
-                self._index_obj.insert_nodes(nodes)
-        except Exception as e:
-            raise EmbedError(f"embed/upsert failed for {path}: {e}") from e
-
-        doc_ids = [n.node_id for n in nodes]
-        self.manifest.files[str(path)] = FileEntry(
+        entry = FileEntry(
             sha256=digest,
             mtime_ns=st.st_mtime_ns,
             size=st.st_size,
-            doc_ids=doc_ids,
+            doc_ids=[n.node_id for n in nodes],
             chunk_count=len(nodes),
             last_error=None,
             last_error_at=None,
         )
-        log.info("file_embedded", extra={"file": str(path), "chunks": len(nodes)})
+        return (path, nodes, entry)
 
     def _delete_file(self, path_str: str) -> None:
         assert self.manifest is not None
@@ -458,15 +581,19 @@ class RagIndex:
             return []
         assert self.store is not None
         if self._bm25 is None:
-            try:
-                docstore = self.store.storage_context().docstore
-                nodes = list(docstore.docs.values())
-                if not nodes:
-                    return []
-                self._bm25 = BM25Retriever.from_defaults(nodes=nodes, similarity_top_k=top_k)
-            except Exception as e:
-                log.warning("bm25_init_failed", extra={"err": str(e)})
-                return []
+            with self._bm25_lock:
+                if self._bm25 is None:  # double-checked; two readers can race here
+                    try:
+                        docstore = self.store.storage_context().docstore
+                        nodes = list(docstore.docs.values())
+                        if not nodes:
+                            return []
+                        self._bm25 = BM25Retriever.from_defaults(
+                            nodes=nodes, similarity_top_k=top_k
+                        )
+                    except Exception as e:
+                        log.warning("bm25_init_failed", extra={"err": str(e)})
+                        return []
         try:
             hits: list[NodeWithScore] = self._bm25.retrieve(question)
             return hits

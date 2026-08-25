@@ -16,10 +16,12 @@ def cache_dir() -> str:
 
 
 @lru_cache(maxsize=4)
-def _make(model: str, dim: int | None) -> object:
+def _make(model: str, dim: int | None, batch_size: int) -> object:
     from llama_index.embeddings.fastembed import FastEmbedEmbedding
 
-    return FastEmbedEmbedding(model_name=model, cache_dir=_CACHE_DIR)
+    return FastEmbedEmbedding(
+        model_name=model, cache_dir=_CACHE_DIR, embed_batch_size=batch_size
+    )
 
 
 def get_embedding(cfg: object) -> object:
@@ -27,4 +29,4 @@ def get_embedding(cfg: object) -> object:
     from ragwatcher.config import EmbedCfg
 
     assert isinstance(cfg, EmbedCfg), f"expected EmbedCfg, got {type(cfg)}"
-    return _make(cfg.model, cfg.dim)
+    return _make(cfg.model, cfg.dim, cfg.batch_size)
