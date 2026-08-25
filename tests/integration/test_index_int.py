@@ -73,6 +73,22 @@ def test_delete_removes_chunks(notes_dir: Path) -> None:
         assert "alpha.md" not in " ".join(idx.manifest.files)
 
 
+def test_hybrid_bm25_populated_with_lance_backend(notes_dir: Path) -> None:
+    """Regression: with the default LanceDB backend, the docstore stayed empty
+    (LanceDB owns the text) and BM25 fell back to zero hits — hybrid retrieval
+    was silently dense-only. Fixed by store_nodes_override=True on the index."""
+    settings = Settings()
+    assert settings.store.backend == "lance"
+    with RagIndex(notes_dir, settings) as idx:
+        idx.sync()
+        docstore = idx.store.storage_context().docstore
+        assert len(list(docstore.docs.values())) > 0, "docstore must mirror nodes for BM25"
+
+        r = idx.retrieve("alpha", top_k=2, debug=True)
+        # BM25 half of hybrid must contribute (was 0 before the fix).
+        assert r.stages["bm25_candidates"] > 0
+
+
 def test_query_debug_shape(notes_dir: Path) -> None:
     settings = Settings()
     with RagIndex(notes_dir, settings) as idx:

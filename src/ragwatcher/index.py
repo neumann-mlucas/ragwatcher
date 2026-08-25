@@ -68,43 +68,29 @@ class RetrievalResult:
     timings_ms: dict[str, int]
 
 
-class _RWLock:
-    """Cross-process writer lock. Readers don't lock — the underlying store
-    (LanceDB) is transactional; SimpleStore reads are dict snapshots.
+class _WriterLock:
+    """Cross-process writer lock. Readers don't lock — LanceDB is
+    transactional (default backend); SimpleStore is single-process only.
 
     `exclusive()` serializes syncs across processes: one writer at a time.
     Blocks up to `_EXCLUSIVE_TIMEOUT_SEC` waiting for a competing writer,
     then raises LockHeld.
 
     Windows fallback: `filelock.FileLock`. Unix: stdlib `fcntl.flock`.
-
-    Named _RWLock for parity with earlier PLAN naming; reader side is a
-    no-op because readers never contend with each other and don't need to
-    block writers (writers just quickly grab exclusive during commits).
     """
 
     _EXCLUSIVE_TIMEOUT_SEC = 60.0
 
     def __init__(self, path: Path) -> None:
         self.path = path
-
-    def acquire_shared(self) -> None:
-        # No-op: reader side is unlocked. Path exists so `close()` works
-        # uniformly and the lock file is created for the writer to open.
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        if not self.path.exists():
-            self.path.touch()
-
-    def release(self) -> None:
-        # No shared state to release; writers manage their own lifetime.
-        return
 
     def exclusive(self) -> Any:
         return _ExclusiveScope(self)
 
 
 class _ExclusiveScope:
-    def __init__(self, lock: _RWLock) -> None:
+    def __init__(self, lock: _WriterLock) -> None:
         self._lock = lock
         self._fd: int | None = None
         self._fallback: FileLock | None = None
@@ -113,14 +99,14 @@ class _ExclusiveScope:
         if sys.platform.startswith("win"):
             self._fallback = FileLock(str(self._lock.path))
             try:
-                self._fallback.acquire(timeout=_RWLock._EXCLUSIVE_TIMEOUT_SEC)
+                self._fallback.acquire(timeout=_WriterLock._EXCLUSIVE_TIMEOUT_SEC)
             except FileLockTimeout as e:
                 raise LockHeld(str(self._lock.path)) from e
             return
         import fcntl
 
         self._fd = os.open(str(self._lock.path), os.O_CREAT | os.O_RDWR, 0o644)
-        deadline = time.monotonic() + _RWLock._EXCLUSIVE_TIMEOUT_SEC
+        deadline = time.monotonic() + _WriterLock._EXCLUSIVE_TIMEOUT_SEC
         while True:
             try:
                 fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -150,10 +136,10 @@ class RagIndex:
         self.config = config
         self.persist_dir = self.data_dir / config.store.path
         self.persist_dir.mkdir(parents=True, exist_ok=True)
-        # Shared/exclusive lock: many readers coexist; sync() upgrades to
-        # exclusive around the write phase. Windows falls back to a single
-        # exclusive filelock (same file, same LockHeld semantics on contention).
-        self._lock = _RWLock(self.persist_dir / "lock")
+        # Writer-only cross-process lock. Readers don't take it — LanceDB is
+        # transactional; SimpleStore is single-process. Windows falls back to
+        # filelock (same file, same LockHeld semantics on contention).
+        self._lock = _WriterLock(self.persist_dir / "lock")
         self._write_lock = threading.Lock()  # in-process serialization for sync()
         self.store: Store | None = None
         self.manifest: Manifest | None = None
@@ -171,7 +157,6 @@ class RagIndex:
         self._closed = False
 
     def __enter__(self) -> RagIndex:
-        self._lock.acquire_shared()
         self._open()
         return self
 
@@ -186,23 +171,21 @@ class RagIndex:
         if self._closed:
             return
         self._closed = True
+        if not self._dirty:
+            return
         try:
-            if self._dirty:
+            with self._write_lock, self._lock.exclusive():
+                assert self.store is not None and self.manifest is not None
                 try:
-                    with self._write_lock, self._lock.exclusive():
-                        assert self.store is not None and self.manifest is not None
-                        try:
-                            self.store.persist()
-                            self._check_store_invariant()
-                            manifest.save(self.persist_dir / "manifest.json", self.manifest)
-                        except StoreError as e:
-                            log.warning("persist_failed", extra={"err": str(e)})
-                except LockHeld:
-                    # Another writer holds exclusive; sync() already wrote the
-                    # latest good state, losing this redundant re-persist is OK.
-                    log.warning("close_persist_skipped_lock_timeout")
-        finally:
-            self._lock.release()
+                    self.store.persist()
+                    self._check_store_invariant()
+                    manifest.save(self.persist_dir / "manifest.json", self.manifest)
+                except StoreError as e:
+                    log.warning("persist_failed", extra={"err": str(e)})
+        except LockHeld:
+            # Another writer holds exclusive; sync() already wrote the latest
+            # good state, losing this redundant re-persist is OK.
+            log.warning("close_persist_skipped_lock_timeout")
 
     def _open(self) -> None:
         from llama_index.core import Settings as LISettings
@@ -285,6 +268,10 @@ class RagIndex:
                         self._index_obj = VectorStoreIndex(
                             nodes=all_nodes,
                             storage_context=self.store.storage_context(),
+                            # Mirror nodes into the docstore even when the vector
+                            # store owns the text (LanceDB does). Without this the
+                            # docstore stays empty and BM25 falls back to zero hits.
+                            store_nodes_override=True,
                         )
                     else:
                         self._index_obj.insert_nodes(all_nodes)
@@ -471,7 +458,9 @@ class RagIndex:
         # Do NOT feed docstore nodes here: that path silently re-embeds
         # everything and hides real load failures.
         if self.store.persisted_node_count() == 0:
-            self._index_obj = VectorStoreIndex(nodes=[], storage_context=ctx)
+            self._index_obj = VectorStoreIndex(
+                nodes=[], storage_context=ctx, store_nodes_override=True
+            )
             return self._index_obj
 
         try:
