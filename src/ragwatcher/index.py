@@ -166,6 +166,9 @@ class RagIndex:
         # otherwise readers would stall up to _EXCLUSIVE_TIMEOUT_SEC waiting
         # on a competing writer just to redo work sync() already did.
         self._dirty = False
+        # Guards against double-close (signal handler + finally in cli.serve).
+        # Second close would re-take the writer lock, possibly waiting 60s.
+        self._closed = False
 
     def __enter__(self) -> RagIndex:
         self._lock.acquire_shared()
@@ -180,6 +183,9 @@ class RagIndex:
         # Only re-persist here if this session actually mutated state; a
         # read-only session must not contend for the writer lock (would stall
         # up to _EXCLUSIVE_TIMEOUT_SEC against a live writer).
+        if self._closed:
+            return
+        self._closed = True
         try:
             if self._dirty:
                 try:
@@ -250,7 +256,11 @@ class RagIndex:
                 s = self._stage_file(p)
                 if s is not None:
                     staged.append(s)
-            except ReadError as e:
+            except (ReadError, EmbedError, StoreError) as e:
+                # Semantic splitter path can raise EmbedError from _stage_file
+                # (it calls the embed model at chunk time). Recursive splitter
+                # only raises ReadError; keeping both keeps sync from aborting
+                # when a non-default chunk strategy hits a bad file.
                 errors[str(p)] = str(e)
                 self._record_error(p, e)
                 log.warning("file_failed", extra={"file": str(p), "err": str(e)})
@@ -421,14 +431,19 @@ class RagIndex:
         # doc_ids are node_ids (see _stage_file). vs.delete() takes ref_doc_id
         # (=Document.doc_id=sha256), which never matches; delete_nodes() is the
         # right API and both SimpleVectorStore and LanceDBVectorStore support it.
-        import contextlib
-
         assert self.store is not None
         if not doc_ids:
             return
         vs = self.store.vector_store()
-        with contextlib.suppress(Exception):
+        try:
             vs.delete_nodes(doc_ids)
+        except Exception as e:
+            # Loud, not silent: silent no-op here is the exact class of bug
+            # (`vs.delete` mismatch) that let old chunks accumulate for months.
+            log.warning(
+                "delete_nodes_failed",
+                extra={"err": str(e), "count": len(doc_ids), "backend": self.store.backend},
+            )
 
     def _record_error(self, path: Path, exc: Exception) -> None:
         assert self.manifest is not None
@@ -469,8 +484,11 @@ class RagIndex:
         return self._index_obj
 
     def _reset_retriever(self) -> None:
-        # Force rebuild w/ new nodes
-        pass
+        # BM25 snapshots the docstore at build time; drop it so the next
+        # _bm25_retrieve rebuilds against the post-sync nodes. _index_obj is
+        # mutated in place by insert_nodes/delete_nodes, so no reset needed.
+        with self._bm25_lock:
+            self._bm25 = None
 
     def _check_store_invariant(self) -> None:
         """Loud failure if manifest claims chunks but store is empty *on disk*.
