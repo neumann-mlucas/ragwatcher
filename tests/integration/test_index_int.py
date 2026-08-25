@@ -44,6 +44,35 @@ def test_manifest_survives_restart(notes_dir: Path) -> None:
         assert r.plan.is_noop()
 
 
+def test_update_removes_old_chunks(notes_dir: Path) -> None:
+    """Regression: _delete_doc_ids was calling vs.delete(node_id) — a silent
+    no-op — so old chunks accumulated on every update. Fixed by delete_nodes()."""
+    settings = Settings()
+    with RagIndex(notes_dir, settings) as idx:
+        idx.sync()
+        before = idx.store.persisted_node_count()
+        assert before > 0
+
+        (notes_dir / "alpha.md").write_text("# alpha\n\ntotally different body\n")
+        idx.sync()
+        after = idx.store.persisted_node_count()
+
+        # Old alpha chunks gone, new ones in — net count must equal manifest.
+        expected = sum(e.chunk_count for e in idx.manifest.files.values())
+        assert after == expected, (before, after, expected)
+
+
+def test_delete_removes_chunks(notes_dir: Path) -> None:
+    settings = Settings()
+    with RagIndex(notes_dir, settings) as idx:
+        idx.sync()
+        (notes_dir / "alpha.md").unlink()
+        idx.sync()
+        expected = sum(e.chunk_count for e in idx.manifest.files.values())
+        assert idx.store.persisted_node_count() == expected
+        assert "alpha.md" not in " ".join(idx.manifest.files)
+
+
 def test_query_debug_shape(notes_dir: Path) -> None:
     settings = Settings()
     with RagIndex(notes_dir, settings) as idx:

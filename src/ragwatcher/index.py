@@ -309,14 +309,17 @@ class RagIndex:
             for path_str in plan.delete:
                 self._delete_file(path_str)
 
-            if plan.add or plan.update or plan.delete:
+            store_changed = (insert_ok and bool(staged)) or bool(plan.delete)
+            manifest_changed = store_changed or bool(errors)
+            if store_changed:
                 # Persist store first, then save manifest — so manifest never
                 # references doc_ids that failed to reach the vector store.
                 self.store.persist()
                 self._check_store_invariant()
+                self._dirty = True
+            if manifest_changed:
                 manifest.save(self.persist_dir / "manifest.json", self.manifest)
                 self._reset_retriever()
-                self._dirty = True
 
         return SyncResult(plan=plan, errors=errors, duration_ms=int((time.monotonic() - t0) * 1000))
 
@@ -415,13 +418,17 @@ class RagIndex:
             self._delete_doc_ids(entry.doc_ids)
 
     def _delete_doc_ids(self, doc_ids: list[str]) -> None:
+        # doc_ids are node_ids (see _stage_file). vs.delete() takes ref_doc_id
+        # (=Document.doc_id=sha256), which never matches; delete_nodes() is the
+        # right API and both SimpleVectorStore and LanceDBVectorStore support it.
         import contextlib
 
         assert self.store is not None
+        if not doc_ids:
+            return
         vs = self.store.vector_store()
-        for did in doc_ids:
-            with contextlib.suppress(Exception):
-                vs.delete(did)
+        with contextlib.suppress(Exception):
+            vs.delete_nodes(doc_ids)
 
     def _record_error(self, path: Path, exc: Exception) -> None:
         assert self.manifest is not None
