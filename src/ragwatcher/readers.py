@@ -44,11 +44,15 @@ def _pdf(path: Path) -> tuple[str, dict[str, Any]]:
     except ImportError:
         fitz = None
 
+    # NOTE: do NOT put pdf_backend / diagnostic fields into the returned
+    # metadata dict — those propagate into the vector store schema, and
+    # LanceDB rejects inserts when a new metadata key appears on an
+    # existing table. Log them instead.
     if fitz is not None:
         try:
             with fitz.open(str(path)) as doc:
                 parts = [p.get_text() for p in doc]
-            return "\n\n".join(parts), {"page_count": len(parts), "pdf_backend": "pymupdf"}
+            return "\n\n".join(parts), {"page_count": len(parts)}
         except Exception as e:
             log.warning(
                 "pymupdf_failed_fallback_pypdf", extra={"file": str(path), "err": str(e)}
@@ -61,7 +65,7 @@ def _pdf(path: Path) -> tuple[str, dict[str, Any]]:
     try:
         reader = PdfReader(str(path))
         parts = [(p.extract_text() or "") for p in reader.pages]
-        return "\n\n".join(parts), {"page_count": len(reader.pages), "pdf_backend": "pypdf"}
+        return "\n\n".join(parts), {"page_count": len(reader.pages)}
     except Exception as e:
         raise ReadError(f"pdf read failed {path}: {e}") from e
 
