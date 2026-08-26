@@ -7,11 +7,20 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 from ragwatcher.errors import ReadError
+from ragwatcher.logging import get_logger
+
+log = get_logger("readers")
+
+# pypdf spams the root logger on malformed PDFs ("Ignoring wrong pointing
+# object", "incorrect startxref"). Route to its own logger at ERROR so a
+# junk-PDF corpus doesn't drown structured logs.
+logging.getLogger("pypdf").setLevel(logging.ERROR)
 
 Reader = Callable[[Path], tuple[str, dict[str, Any]]]
 
@@ -24,6 +33,25 @@ def _plain(path: Path) -> tuple[str, dict[str, Any]]:
 
 
 def _pdf(path: Path) -> tuple[str, dict[str, Any]]:
+    # pymupdf (from the [pdf-pro] extra) tolerates malformed xref tables,
+    # escaped strings, and truncated dicts that make pypdf spin in recovery
+    # loops for minutes on a corrupt file. Try it first; fall back to pypdf
+    # so a missing extra keeps the default install working.
+    try:
+        import fitz  # type: ignore[import-untyped]
+    except ImportError:
+        fitz = None
+
+    if fitz is not None:
+        try:
+            with fitz.open(str(path)) as doc:
+                parts = [p.get_text() for p in doc]
+            return "\n\n".join(parts), {"page_count": len(parts), "pdf_backend": "pymupdf"}
+        except Exception as e:
+            log.warning(
+                "pymupdf_failed_fallback_pypdf", extra={"file": str(path), "err": str(e)}
+            )
+
     try:
         from pypdf import PdfReader
     except ImportError as e:
@@ -31,7 +59,7 @@ def _pdf(path: Path) -> tuple[str, dict[str, Any]]:
     try:
         reader = PdfReader(str(path))
         parts = [(p.extract_text() or "") for p in reader.pages]
-        return "\n\n".join(parts), {"page_count": len(reader.pages)}
+        return "\n\n".join(parts), {"page_count": len(reader.pages), "pdf_backend": "pypdf"}
     except Exception as e:
         raise ReadError(f"pdf read failed {path}: {e}") from e
 
