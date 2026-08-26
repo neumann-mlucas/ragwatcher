@@ -218,11 +218,15 @@ class RagIndex:
     # ---------------- sync ----------------
 
     def sync(
-        self, full: bool = False, dry_run: bool = False, show_progress: bool = False
+        self,
+        full: bool = False,
+        dry_run: bool = False,
+        show_progress: bool = False,
+        retry_errors: bool = False,
     ) -> SyncResult:
         assert self.manifest is not None and self.store is not None
         t0 = time.monotonic()
-        plan = self._plan_sync(full=full)
+        plan = self._plan_sync(full=full, retry_errors=retry_errors)
         errors: dict[str, str] = {}
 
         if dry_run or plan.is_noop():
@@ -230,11 +234,12 @@ class RagIndex:
 
         targets = plan.add + plan.update
         progress = _maybe_progress(len(targets)) if show_progress else None
+        total = len(targets)
 
         # Stage 1: read + chunk every file. No embed yet — per-file errors here
-        # never poison the shared embed batch.
+        # never poison the embed chunk they'd otherwise share.
         staged: list[tuple[Path, list[BaseNode], FileEntry]] = []
-        for p in targets:
+        for i, p in enumerate(targets, 1):
             try:
                 s = self._stage_file(p)
                 if s is not None:
@@ -249,81 +254,134 @@ class RagIndex:
                 log.warning("file_failed", extra={"file": str(p), "err": str(e)})
             if progress:
                 progress[0].advance(progress[1])
+            # Structured progress for --json / long non-TTY runs where the
+            # Rich bar is suppressed. Every 25 files or on the last file.
+            if i % 25 == 0 or i == total:
+                log.info(
+                    "stage_progress",
+                    extra={"done": i, "total": total, "staged": len(staged), "failed": len(errors)},
+                )
         if progress:
             progress[0].stop()
+
+        # Guardrail: log the write-phase shape so a --full on a big corpus
+        # doesn't kick off in silence.
+        node_est = sum(len(nodes) for _, nodes, _ in staged)
+        chunk_size = self.config.sync.files_per_chunk
+        log.info(
+            "write_phase_starting",
+            extra={
+                "files": len(staged),
+                "nodes_est": node_est,
+                "delete_files": len(plan.delete),
+                "files_per_chunk": chunk_size,
+                "chunks": (len(staged) + chunk_size - 1) // chunk_size if staged else 0,
+            },
+        )
 
         # Write phase — serialize across processes (cross-proc exclusive
         # upgrade) and threads (in-process lock). Everything below mutates
         # store + manifest; readers must not observe torn state.
         with self._write_lock, self._lock.exclusive():
-            # Stage 2: single batch embed + insert. New nodes go in FIRST so a
-            # batch failure leaves the previous chunks intact (delete happens
-            # only after the insert succeeds). FastEmbed batches internally
-            # (config.embed.batch_size); one call amortizes overhead across files.
-            insert_ok = True
-            if staged:
-                all_nodes = [n for _, nodes, _ in staged for n in nodes]
+            successful_files = 0
+            chunks_total = (len(staged) + chunk_size - 1) // chunk_size if staged else 0
+            for ci in range(0, len(staged), chunk_size):
+                chunk = staged[ci : ci + chunk_size]
+                chunk_idx = ci // chunk_size + 1
+                chunk_nodes = [n for _, nodes, _ in chunk for n in nodes]
                 try:
-                    if self._index_obj is None:
-                        self._index_obj = VectorStoreIndex(
-                            nodes=all_nodes,
-                            storage_context=self.store.storage_context(),
-                            # Mirror nodes into the docstore even when the vector
-                            # store owns the text (LanceDB does). Without this the
-                            # docstore stays empty and BM25 falls back to zero hits.
-                            store_nodes_override=True,
-                        )
-                    else:
-                        self._index_obj.insert_nodes(all_nodes)
+                    self._insert_chunk(chunk_nodes)
                 except Exception as e:
-                    # Roll back any partially inserted nodes so the store never
-                    # holds orphans that would trip _check_store_invariant.
-                    # Node IDs are stable, delete-by-id is idempotent.
-                    self._delete_doc_ids([n.node_id for n in all_nodes])
-                    # ponytail: batch-or-nothing on embed failure; add per-file
-                    # fallback if a bad chunk starts killing whole syncs in practice.
-                    for p, _nodes, _entry in staged:
+                    # Rollback partial inserts (node IDs stable, delete-by-id
+                    # idempotent) so the store never holds orphans that would
+                    # trip _check_store_invariant.
+                    self._delete_doc_ids([n.node_id for n in chunk_nodes])
+                    for p, _nodes, _entry in chunk:
                         errors[str(p)] = f"batch embed failed: {e}"
                         self._record_error(p, EmbedError(str(e)))
-                    log.warning("batch_embed_failed", extra={"err": str(e), "files": len(staged)})
-                    insert_ok = False
-                    staged = []
+                    log.warning(
+                        "chunk_embed_failed",
+                        extra={
+                            "err": str(e),
+                            "chunk": chunk_idx,
+                            "chunks_total": chunks_total,
+                            "files": len(chunk),
+                        },
+                    )
+                    continue
 
-            # Stage 3: drop the previous chunks for updates now that new ones
-            # are safely in the store. Skipped when the batch failed — the old
-            # chunks remain the only copy and the manifest still points to them.
-            if insert_ok:
-                for p, _nodes, _entry in staged:
+                # Chunk succeeded: drop old chunks for updates, replace the
+                # manifest entries, persist store + manifest. Checkpointing
+                # per chunk means a mid-sync kill loses at most one chunk of
+                # work, not the whole run.
+                for p, _nodes, _entry in chunk:
                     old = self.manifest.files.get(str(p))
                     if old and old.doc_ids:
                         self._delete_doc_ids(old.doc_ids)
+                for p, nodes, entry in chunk:
+                    self.manifest.files[str(p)] = entry
+                    log.info("file_embedded", extra={"file": str(p), "chunks": len(nodes)})
+                    successful_files += 1
 
-            # Stage 4: manifest write for successfully embedded files.
-            for p, nodes, entry in staged:
-                self.manifest.files[str(p)] = entry
-                log.info("file_embedded", extra={"file": str(p), "chunks": len(nodes)})
-
-            for path_str in plan.delete:
-                self._delete_file(path_str)
-
-            store_changed = (insert_ok and bool(staged)) or bool(plan.delete)
-            manifest_changed = store_changed or bool(errors)
-            if store_changed:
-                # Persist store first, then save manifest — so manifest never
-                # references doc_ids that failed to reach the vector store.
+                # ponytail: persist runs inside the exclusive writer lock,
+                # so concurrent writers wait up to _EXCLUSIVE_TIMEOUT_SEC.
+                # LanceDB persist is fast; if a slower backend lands, split
+                # the lock (exclusive for insert/delete, release before
+                # persist) so writer contention doesn't stall on I/O.
                 self.store.persist()
                 self._check_store_invariant()
-                self._dirty = True
-            if manifest_changed:
                 manifest.save(self.persist_dir / "manifest.json", self.manifest)
+                self._dirty = True
+                log.info(
+                    "chunk_committed",
+                    extra={
+                        "chunk": chunk_idx,
+                        "chunks_total": chunks_total,
+                        "done_files": successful_files,
+                        "staged_files": len(staged),
+                    },
+                )
+
+            # Deletions are cheap; do them once at the end and persist if
+            # any chunk-embed didn't already trigger a persist.
+            for path_str in plan.delete:
+                self._delete_file(path_str)
+            if plan.delete:
+                self.store.persist()
+                self._check_store_invariant()
+                manifest.save(self.persist_dir / "manifest.json", self.manifest)
+                self._dirty = True
+            elif errors and not self._dirty:
+                # Errors-only run: save manifest so last_error survives.
+                manifest.save(self.persist_dir / "manifest.json", self.manifest)
+
+            if successful_files or plan.delete:
                 self._reset_retriever()
 
         return SyncResult(plan=plan, errors=errors, duration_ms=int((time.monotonic() - t0) * 1000))
 
-    def _plan_sync(self, full: bool) -> SyncPlan:
+    def _insert_chunk(self, nodes: list[BaseNode]) -> None:
+        assert self.store is not None
+        if not nodes:
+            return
+        if self._index_obj is None:
+            self._index_obj = VectorStoreIndex(
+                nodes=nodes,
+                storage_context=self.store.storage_context(),
+                # Mirror nodes into the docstore even when the vector store
+                # owns the text (LanceDB does). Without this the docstore
+                # stays empty and BM25 falls back to zero hits.
+                store_nodes_override=True,
+            )
+        else:
+            self._index_obj.insert_nodes(nodes)
+
+    def _plan_sync(self, full: bool, retry_errors: bool = False) -> SyncPlan:
         assert self.manifest is not None
         disk = self._scan_disk()
         plan = SyncPlan()
+        cutoff_hours = self.config.sync.retry_error_after_hours
+        skipped_recent_errors = 0
 
         for p in disk:
             key = str(p)
@@ -331,6 +389,19 @@ class RagIndex:
             if entry is None:
                 plan.add.append(p)
                 continue
+
+            # Skip repeat-broken files on --full unless the caller asked to
+            # retry. Without this a single unreadable PDF re-consumes the
+            # whole embed budget on every rescan.
+            if (
+                full
+                and not retry_errors
+                and entry.last_error
+                and _error_is_recent(entry.last_error_at, cutoff_hours)
+            ):
+                skipped_recent_errors += 1
+                continue
+
             st = p.stat()
             fast_hit = not full and entry.mtime_ns == st.st_mtime_ns and entry.size == st.st_size
             if fast_hit:
@@ -344,6 +415,11 @@ class RagIndex:
             if key not in disk_keys:
                 plan.delete.append(key)
 
+        if skipped_recent_errors:
+            log.info(
+                "plan_skipped_recent_errors",
+                extra={"count": skipped_recent_errors, "cutoff_hours": cutoff_hours},
+            )
         return plan
 
     def _scan_disk(self) -> list[Path]:
@@ -375,7 +451,7 @@ class RagIndex:
         No embed here — the batch embed happens once per sync so FastEmbed can
         pack many files into each backend call.
         """
-        text, meta = readers.read(path)
+        text, meta = readers.read(path, timeout_sec=self.config.files.read_timeout_sec)
         if not text.strip():
             return None
         st = path.stat()
@@ -457,6 +533,11 @@ class RagIndex:
         # Empty store → build an empty index bound to the storage context.
         # Do NOT feed docstore nodes here: that path silently re-embeds
         # everything and hides real load failures.
+        # ponytail: pre-existing stores that predate store_nodes_override
+        # have an empty docstore + non-empty vector store. `--full` fixes
+        # them but re-embeds everything. Add a `rebuild-docstore` CLI that
+        # reads the LanceDB rows back into the docstore without re-embed
+        # if the migration cost becomes real.
         if self.store.persisted_node_count() == 0:
             self._index_obj = VectorStoreIndex(
                 nodes=[], storage_context=ctx, store_nodes_override=True
@@ -596,6 +677,10 @@ class RagIndex:
         )
 
     def _bm25_retrieve(self, question: str, top_k: int) -> list[NodeWithScore]:
+        # ponytail: BM25 rebuilds from a full docstore walk after every sync
+        # (see _reset_retriever). O(N) at build time — cheap up to ~10k nodes,
+        # hurts past ~500k. Swap for an on-disk BM25 index if a big corpus
+        # measures as bm25_init-dominated in retrieve latency.
         try:
             from llama_index.retrievers.bm25 import BM25Retriever
         except ImportError:
@@ -665,6 +750,22 @@ class RagIndex:
                 }
             )
         return out
+
+
+def _error_is_recent(last_error_at: str | None, cutoff_hours: int) -> bool:
+    """True if `last_error_at` is a parseable ISO timestamp within cutoff."""
+    if not last_error_at or cutoff_hours <= 0:
+        return False
+    from datetime import UTC, datetime
+
+    try:
+        err_dt = datetime.fromisoformat(last_error_at)
+    except (TypeError, ValueError):
+        return False
+    if err_dt.tzinfo is None:
+        err_dt = err_dt.replace(tzinfo=UTC)
+    age_hours = (datetime.now(UTC) - err_dt).total_seconds() / 3600
+    return age_hours < cutoff_hours
 
 
 def _maybe_progress(total: int) -> tuple[Any, Any] | None:

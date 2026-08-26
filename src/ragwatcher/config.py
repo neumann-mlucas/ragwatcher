@@ -82,6 +82,21 @@ class FilesCfg(BaseModel):
     )
     max_file_bytes: int = 20_000_000
     follow_symlinks: bool = False
+    # Hard cap on a single file's read+chunk stage. Kills pathological PDFs
+    # / huge JSONs that would otherwise pin the stage phase forever.
+    # 0 disables. Unix only (SIGALRM); ignored on Windows.
+    read_timeout_sec: int = 60
+
+
+class SyncCfg(BaseModel):
+    # Files per embed/insert chunk. Small chunks give checkpointed progress
+    # and resumability at the cost of a few more persist calls. 25 amortizes
+    # persist overhead on FastEmbed while capping worst-case rollback.
+    files_per_chunk: int = 25
+    # Skip files whose last_error is fresher than this on --full, unless
+    # --retry-errors is passed. Prevents a broken PDF from re-costing the
+    # entire embed budget every rescan.
+    retry_error_after_hours: int = 24
 
 
 class ContextCfg(BaseModel):
@@ -106,6 +121,7 @@ class Settings(BaseSettings):
     server: ServerCfg = Field(default_factory=ServerCfg)
     log: LogCfg = Field(default_factory=LogCfg)
     files: FilesCfg = Field(default_factory=FilesCfg)
+    sync: SyncCfg = Field(default_factory=SyncCfg)
     context: ContextCfg = Field(default_factory=ContextCfg)
 
 

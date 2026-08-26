@@ -23,6 +23,28 @@ def notes_dir(tmp_path: Path) -> Path:
     return dst
 
 
+def test_chunked_insert_persists_per_chunk(notes_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Chunked insert must call store.persist() once per chunk, not once per sync.
+    Small chunk sizes give per-chunk checkpointing — a mid-sync kill on a big
+    corpus loses at most one chunk of work, not the whole run."""
+    settings = Settings()
+    # Force one file per chunk so we get a persist per file.
+    settings.sync.files_per_chunk = 1
+    with RagIndex(notes_dir, settings) as idx:
+        persist_calls = 0
+        real_persist = idx.store.persist
+
+        def counting_persist() -> None:
+            nonlocal persist_calls
+            persist_calls += 1
+            real_persist()
+
+        monkeypatch.setattr(idx.store, "persist", counting_persist)
+        idx.sync()
+        # 2 files in the fixture → 2 chunk persists (delete-only path not hit).
+        assert persist_calls >= 2, persist_calls
+
+
 def test_failed_batch_leaves_prior_state_intact(notes_dir: Path) -> None:
     settings = Settings()
     # First sync succeeds — establishes real chunks + manifest.

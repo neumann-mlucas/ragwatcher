@@ -77,6 +77,57 @@ def test_update_on_content_change(tiny_dir: Path):
         assert target in plan.update
 
 
+def test_full_skips_recent_error_files(tiny_dir: Path):
+    """--full re-scans everything except files whose last_error is fresh:
+    a single broken PDF must not re-consume the entire embed budget every
+    rescan. --retry-errors bypasses the skip."""
+    from datetime import UTC, datetime
+
+    from ragwatcher.manifest import FileEntry, sha256_file
+
+    settings = Settings()
+    with RagIndex(tiny_dir, settings) as idx:
+        target = tiny_dir / "a.md"
+        st = target.stat()
+        idx.manifest.files[str(target)] = FileEntry(
+            sha256=sha256_file(target),
+            mtime_ns=st.st_mtime_ns,
+            size=st.st_size,
+            chunk_count=1,
+            last_error={"type": "ReadError", "message": "boom"},
+            last_error_at=datetime.now(UTC).isoformat(),
+        )
+
+        plan = idx._plan_sync(full=True)
+        assert target not in plan.update, "recent-error file must be skipped on --full"
+
+        plan_retry = idx._plan_sync(full=True, retry_errors=True)
+        assert target in plan_retry.update, "--retry-errors must include it"
+
+
+def test_full_reincludes_stale_error_files(tiny_dir: Path):
+    """Old last_error (past cutoff) doesn't gate the file — it retries."""
+    from datetime import UTC, datetime, timedelta
+
+    from ragwatcher.manifest import FileEntry, sha256_file
+
+    settings = Settings()
+    with RagIndex(tiny_dir, settings) as idx:
+        target = tiny_dir / "a.md"
+        st = target.stat()
+        old = datetime.now(UTC) - timedelta(hours=idx.config.sync.retry_error_after_hours + 1)
+        idx.manifest.files[str(target)] = FileEntry(
+            sha256=sha256_file(target),
+            mtime_ns=st.st_mtime_ns,
+            size=st.st_size,
+            chunk_count=1,
+            last_error={"type": "ReadError", "message": "old"},
+            last_error_at=old.isoformat(),
+        )
+        plan = idx._plan_sync(full=True)
+        assert target in plan.update
+
+
 def test_full_rehashes(tiny_dir: Path):
     settings = Settings()
     with RagIndex(tiny_dir, settings) as idx:

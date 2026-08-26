@@ -83,6 +83,10 @@ class Watcher:
             try:
                 self._sync()
             except Exception as e:
+                # ponytail: no backoff on repeated sync_failed — the same
+                # bad file will loop forever if the debounce keeps firing.
+                # Add exponential backoff / circuit break after M consecutive
+                # failures if this shows up in a real incident.
                 log.exception("sync_failed", extra={"err": str(e)})
 
     def _periodic(self) -> None:

@@ -255,6 +255,13 @@ def index_cmd(
     dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
     json_out: Annotated[bool, typer.Option("--json")] = False,
     watch: Annotated[bool, typer.Option("--watch", help="Stream events until Ctrl-C")] = False,
+    retry_errors: Annotated[
+        bool,
+        typer.Option(
+            "--retry-errors",
+            help="Re-attempt files with a recent last_error on --full (default: skip).",
+        ),
+    ] = False,
 ) -> None:
     """Incremental sync. Exits after unless --watch."""
     from ragwatcher.watch import Watcher
@@ -262,7 +269,9 @@ def index_cmd(
     idx = _open_index(directory.resolve())
     try:
         show_prog = not json_out and idx.config.log.format != "json"
-        result = idx.sync(full=full, dry_run=dry_run, show_progress=show_prog)
+        result = idx.sync(
+            full=full, dry_run=dry_run, show_progress=show_prog, retry_errors=retry_errors
+        )
         plan_summary = result.plan.as_summary()
         summary: dict[str, object] = {
             "plan": plan_summary,

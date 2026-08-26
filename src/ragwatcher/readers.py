@@ -8,6 +8,8 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import signal
+import threading
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -185,9 +187,42 @@ EXT_TO_READER: dict[str, Reader] = {
 SUPPORTED_EXTS = frozenset(EXT_TO_READER.keys())
 
 
-def read(path: Path) -> tuple[str, dict[str, Any]]:
-    """Read text + metadata for supported ext, else ReadError."""
+def read(path: Path, timeout_sec: int = 0) -> tuple[str, dict[str, Any]]:
+    """Read text + metadata for supported ext, else ReadError.
+
+    timeout_sec > 0 wraps the read in a SIGALRM watchdog on Unix (raises
+    ReadError if the reader takes longer). Ignored on Windows (no SIGALRM);
+    a pathological file there can still pin the stage phase.
+    """
     reader = EXT_TO_READER.get(path.suffix.lower())
     if reader is None:
         raise ReadError(f"unsupported extension: {path.suffix}")
-    return reader(path)
+    # SIGALRM only works from the main thread of the main interpreter; the
+    # watch-triggered sync runs on a worker thread and silently loses the
+    # guard there. Acceptable trade-off: CLI runs (the ones that pin a
+    # process for hours) get the watchdog; the always-running watcher does
+    # not, and relies on pymupdf-first PDF handling.
+    if (
+        timeout_sec <= 0
+        or not hasattr(signal, "SIGALRM")
+        or threading.current_thread() is not threading.main_thread()
+    ):
+        return reader(path)
+    return _read_with_timeout(reader, path, timeout_sec)
+
+
+def _read_with_timeout(
+    reader: Reader, path: Path, timeout_sec: int
+) -> tuple[str, dict[str, Any]]:
+    def _on_alarm(_signum: int, _frame: Any) -> None:
+        raise TimeoutError(f"reader exceeded {timeout_sec}s on {path}")
+
+    prev = signal.signal(signal.SIGALRM, _on_alarm)
+    signal.alarm(timeout_sec)
+    try:
+        return reader(path)
+    except TimeoutError as e:
+        raise ReadError(str(e)) from e
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, prev)
