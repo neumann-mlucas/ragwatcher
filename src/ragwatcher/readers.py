@@ -52,9 +52,7 @@ def _pdf(path: Path) -> tuple[str, dict[str, Any]]:
                 parts = [p.get_text() for p in doc]
             return "\n\n".join(parts), {"page_count": len(parts)}
         except Exception as e:
-            log.warning(
-                "pymupdf_failed_fallback_pypdf", extra={"file": str(path), "err": str(e)}
-            )
+            log.warning("pymupdf_failed_fallback_pypdf", extra={"file": str(path), "err": str(e)})
 
     try:
         from pypdf import PdfReader
@@ -213,9 +211,7 @@ def read(path: Path, timeout_sec: int = 0) -> tuple[str, dict[str, Any]]:
     return _read_with_timeout(reader, path, timeout_sec)
 
 
-def _read_with_timeout(
-    reader: Reader, path: Path, timeout_sec: int
-) -> tuple[str, dict[str, Any]]:
+def _read_with_timeout(reader: Reader, path: Path, timeout_sec: int) -> tuple[str, dict[str, Any]]:
     def _on_alarm(_signum: int, _frame: Any) -> None:
         raise TimeoutError(f"reader exceeded {timeout_sec}s on {path}")
 

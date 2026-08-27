@@ -23,7 +23,9 @@ def notes_dir(tmp_path: Path) -> Path:
     return dst
 
 
-def test_chunked_insert_persists_per_chunk(notes_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_chunked_insert_persists_per_chunk(
+    notes_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Chunked insert must call store.persist() once per chunk, not once per sync.
     Small chunk sizes give per-chunk checkpointing — a mid-sync kill on a big
     corpus loses at most one chunk of work, not the whole run."""

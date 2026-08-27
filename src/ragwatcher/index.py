@@ -572,8 +572,7 @@ class RagIndex:
                 ) from e
             if not loaded:
                 raise StoreError(
-                    f"no indices in {self.persist_dir}. "
-                    "Run `ragwatcher index --full` to rebuild."
+                    f"no indices in {self.persist_dir}. Run `ragwatcher index --full` to rebuild."
                 )
             best = max(loaded, key=lambda idx: len(idx.index_struct.nodes_dict))
             dropped_ids: list[str] = []
