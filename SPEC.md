@@ -202,8 +202,7 @@ buffer_size = 1
 [retrieve]
 top_k = 5
 top_k_max = 50
-hybrid = true                         # dense + bm25 fusion
-fusion_mode = "reciprocal_rerank"
+hybrid = true                         # dense + bm25 fusion (RRF)
 neighbor_window = 1
 
 [store]

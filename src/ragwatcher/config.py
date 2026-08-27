@@ -47,7 +47,6 @@ class RetrieveCfg(BaseModel):
     top_k: int = 5
     top_k_max: int = 50
     hybrid: bool = True
-    fusion_mode: str = "reciprocal_rerank"
     neighbor_window: int = 1
 
 
