@@ -3296,6 +3296,7 @@ dependencies = [
     { name = "mcp" },
     { name = "platformdirs" },
     { name = "pydantic-settings" },
+    { name = "pymupdf" },
     { name = "pypdf" },
     { name = "python-docx" },
     { name = "rich" },
@@ -3311,9 +3312,6 @@ dev = [
     { name = "pytest-asyncio" },
     { name = "pytest-cov" },
     { name = "ruff" },
-]
-pdf-pro = [
-    { name = "pymupdf" },
 ]
 remote = [
     { name = "cohere" },
@@ -3338,7 +3336,7 @@ requires-dist = [
     { name = "openai", marker = "extra == 'remote'", specifier = ">=1.40" },
     { name = "platformdirs", specifier = ">=4" },
     { name = "pydantic-settings", specifier = ">=2.4" },
-    { name = "pymupdf", marker = "extra == 'pdf-pro'", specifier = ">=1.24" },
+    { name = "pymupdf", specifier = ">=1.24" },
     { name = "pypdf", specifier = ">=4" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23" },
@@ -3351,7 +3349,7 @@ requires-dist = [
     { name = "typer", specifier = ">=0.12" },
     { name = "watchdog", specifier = ">=4" },
 ]
-provides-extras = ["pdf-pro", "remote", "dev"]
+provides-extras = ["remote", "dev"]
 
 [[package]]
 name = "referencing"

@@ -105,6 +105,31 @@ def test_full_skips_recent_error_files(tiny_dir: Path):
         assert target in plan_retry.update, "--retry-errors must include it"
 
 
+def test_incremental_also_skips_recent_error_files(tiny_dir: Path):
+    """Non-full sync must ALSO skip recent-error files when the file's
+    mtime bumps (fast_hit fails). Prevents the watcher retry-loop that
+    pinned the service at 99% CPU on a truncated PDF."""
+    from datetime import UTC, datetime
+
+    from ragwatcher.manifest import FileEntry
+
+    settings = Settings()
+    with RagIndex(tiny_dir, settings) as idx:
+        target = tiny_dir / "a.md"
+        st = target.stat()
+        idx.manifest.files[str(target)] = FileEntry(
+            sha256="stale-hash",
+            mtime_ns=st.st_mtime_ns - 1,  # fail fast_hit so entry goes to sha compare
+            size=st.st_size,
+            chunk_count=1,
+            last_error={"type": "ReadError", "message": "boom"},
+            last_error_at=datetime.now(UTC).isoformat(),
+        )
+
+        plan = idx._plan_sync(full=False)
+        assert target not in plan.update, "incremental must skip recent-error too"
+
+
 def test_full_reincludes_stale_error_files(tiny_dir: Path):
     """Old last_error (past cutoff) doesn't gate the file — it retries."""
     from datetime import UTC, datetime, timedelta

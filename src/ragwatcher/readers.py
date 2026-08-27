@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import csv
 import json
-import logging
 import signal
 import threading
 from collections.abc import Callable
@@ -19,10 +18,9 @@ from ragwatcher.logging import get_logger
 
 log = get_logger("readers")
 
-# pypdf spams the root logger on malformed PDFs ("Ignoring wrong pointing
-# object", "incorrect startxref"). Route to its own logger at ERROR so a
-# junk-PDF corpus doesn't drown structured logs.
-logging.getLogger("pypdf").setLevel(logging.ERROR)
+# NOTE: pypdf logger silence lives in ragwatcher.logging.setup() so it
+# applies whenever logging is configured (structlog init previously
+# reset root, dropping a here-set level).
 
 Reader = Callable[[Path], tuple[str, dict[str, Any]]]
 

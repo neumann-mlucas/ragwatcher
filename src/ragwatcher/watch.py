@@ -63,7 +63,11 @@ class Watcher:
             self._worker.join(timeout=timeout)
         log.info("watch_stopped")
 
+    _BACKOFF_BASE_SEC = 1.0
+    _BACKOFF_MAX_SEC = 300.0
+
     def _drain(self) -> None:
+        consec_fails = 0
         while not self._stop.is_set():
             try:
                 item = self._q.get(timeout=1.0)
@@ -82,12 +86,23 @@ class Watcher:
                     break
             try:
                 self._sync()
+                consec_fails = 0
             except Exception as e:
-                # ponytail: no backoff on repeated sync_failed — the same
-                # bad file will loop forever if the debounce keeps firing.
-                # Add exponential backoff / circuit break after M consecutive
-                # failures if this shows up in a real incident.
-                log.exception("sync_failed", extra={"err": str(e)})
+                # Exponential backoff after consecutive sync_failed. Without
+                # this a single broken file whose mtime keeps bumping (a
+                # sync tool, atime touch, or the recent-error skip filter
+                # not catching it) pins the watcher at 100% CPU forever.
+                consec_fails += 1
+                delay = min(
+                    self._BACKOFF_BASE_SEC * (2 ** (consec_fails - 1)),
+                    self._BACKOFF_MAX_SEC,
+                )
+                log.exception(
+                    "sync_failed",
+                    extra={"err": str(e), "consec_fails": consec_fails, "backoff_sec": delay},
+                )
+                if self._stop.wait(delay):
+                    return
 
     def _periodic(self) -> None:
         while not self._stop.wait(self._rescan_interval):

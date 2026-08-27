@@ -17,6 +17,7 @@ dependencies = [
     "mcp>=2.0,<3",
     "watchdog>=4",
     "pypdf>=4",
+    "pymupdf>=1.24",
     "python-docx>=1",
     "EbookLib>=0.18",
     "html2text>=2024",
@@ -29,7 +30,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-pdf-pro = ["pymupdf>=1.24"]
 remote = ["qdrant-client>=1.11", "openai>=1.40", "cohere>=5"]
 dev = [
     "pytest>=8",

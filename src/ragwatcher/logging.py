@@ -25,6 +25,16 @@ def setup(level: str = "info", fmt: Literal["text", "json"] = "text") -> None:
     """Configure stdlib + structlog. Always writes to stderr."""
     log_level = getattr(logging, level.upper(), logging.INFO)
 
+    # Silence chatty third-party loggers. pypdf emits WARNING per malformed
+    # xref/stream — a corpus with dozens of broken PDFs drowns real logs.
+    # Set here (not at readers.py import) so structlog / root reconfig
+    # can't unset it later.
+    import warnings
+
+    for noisy in ("pypdf", "pypdf._reader", "pypdf.generic", "PyPDF2"):
+        logging.getLogger(noisy).setLevel(logging.ERROR)
+    warnings.filterwarnings("ignore", module=r"pypdf(\..*)?$")
+
     handler: logging.Handler
     if fmt == "json":
         handler = logging.StreamHandler(sys.stderr)

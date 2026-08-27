@@ -390,12 +390,13 @@ class RagIndex:
                 plan.add.append(p)
                 continue
 
-            # Skip repeat-broken files on --full unless the caller asked to
-            # retry. Without this a single unreadable PDF re-consumes the
-            # whole embed budget on every rescan.
+            # Skip repeat-broken files on any sync unless the caller asked
+            # to retry. Without this a single unreadable file (or a
+            # truncated PDF whose mtime bumps under a sync tool) re-consumes
+            # the whole embed budget every rescan AND, worse, keeps the
+            # watcher in a tight retry loop.
             if (
-                full
-                and not retry_errors
+                not retry_errors
                 and entry.last_error
                 and _error_is_recent(entry.last_error_at, cutoff_hours)
             ):
