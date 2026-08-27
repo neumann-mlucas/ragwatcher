@@ -26,6 +26,12 @@ from ragwatcher.store import Store, make_store
 
 log = get_logger("index")
 
+# Stable id for the single VectorStoreIndex we persist. llama-index otherwise
+# mints a fresh UUID per VectorStoreIndex() call and appends it to
+# index_store.json; that's how we ended up with 3 indices in the same store
+# and `load_index_from_storage` failing with "Expected to load a single index".
+_INDEX_ID = "ragwatcher"
+
 
 @dataclass
 class SyncPlan:
@@ -373,6 +379,7 @@ class RagIndex:
                 # stays empty and BM25 falls back to zero hits.
                 store_nodes_override=True,
             )
+            self._index_obj.set_index_id(_INDEX_ID)
         else:
             self._index_obj.insert_nodes(nodes)
 
@@ -543,15 +550,61 @@ class RagIndex:
             self._index_obj = VectorStoreIndex(
                 nodes=[], storage_context=ctx, store_nodes_override=True
             )
+            self._index_obj.set_index_id(_INDEX_ID)
             return self._index_obj
 
         try:
-            self._index_obj = load_index_from_storage(ctx)
-        except (ValueError, KeyError) as e:
-            raise StoreError(
-                f"failed to load index from {self.persist_dir}: {e}. "
-                "Run `ragwatcher index --full` to rebuild."
-            ) from e
+            # Explicit index_id: from the second sync forward the store has
+            # exactly one index under `_INDEX_ID`, so this is a single load.
+            self._index_obj = load_index_from_storage(ctx, index_id=_INDEX_ID)
+        except ValueError:
+            # Legacy path: older persist accumulated per-sync UUID index
+            # stubs (see _INDEX_ID note). Pick the one with the most nodes,
+            # discard the others by re-persisting under _INDEX_ID.
+            from llama_index.core import load_indices_from_storage
+
+            try:
+                loaded = load_indices_from_storage(ctx)
+            except (ValueError, KeyError) as e:
+                raise StoreError(
+                    f"failed to load index from {self.persist_dir}: {e}. "
+                    "Run `ragwatcher index --full` to rebuild."
+                ) from e
+            if not loaded:
+                raise StoreError(
+                    f"no indices in {self.persist_dir}. "
+                    "Run `ragwatcher index --full` to rebuild."
+                )
+            best = max(loaded, key=lambda idx: len(idx.index_struct.nodes_dict))
+            dropped_ids: list[str] = []
+            for idx in loaded:
+                if idx is best:
+                    continue
+                old_id = idx.index_struct.index_id
+                try:
+                    ctx.index_store.delete_index_struct(old_id)
+                    dropped_ids.append(old_id)
+                except Exception as e:
+                    log.warning("index_stub_drop_failed", extra={"id": old_id, "err": str(e)})
+            best.set_index_id(_INDEX_ID)
+            # Persist so the next process open sees a single index and takes
+            # the fast path. Best-effort — a read-only session that can't
+            # take the writer lock still works via the in-memory migration.
+            try:
+                with self._write_lock, self._lock.exclusive():
+                    self.store.persist()
+                    self._dirty = True
+            except LockHeld:
+                log.warning("index_migration_persist_skipped_lock_held")
+            log.info(
+                "index_migrated_to_stable_id",
+                extra={
+                    "kept_nodes": len(best.index_struct.nodes_dict),
+                    "dropped": dropped_ids,
+                    "index_id": _INDEX_ID,
+                },
+            )
+            self._index_obj = best
         return self._index_obj
 
     def _reset_retriever(self) -> None:
