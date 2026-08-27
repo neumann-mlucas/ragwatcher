@@ -484,6 +484,98 @@ FastMCP is async).
 
 ---
 
+### P7 — Post-incident hardening (real-corpus + service failures)
+
+**Problem.** First real deployment against `/home/neumann/Sync` (~931 files,
+2.7 GB, PDF-heavy) surfaced a stack of latent bugs that made
+`ragwatcher index --full` unusable (8 h+ opaque hang, then a week-long
+watcher retry loop pinning the service at 100 % CPU). Fixes landed
+between commits `b05bf54 … d09d390`.
+
+- [x] P7.1 **BM25 stale after sync.** `_reset_retriever` was `pass` — the
+      first `_bm25_retrieve` snapshot survived every subsequent sync.
+      Fixed to drop `self._bm25` under `_bm25_lock`. (`b05bf54`)
+- [x] P7.2 **Silent `vs.delete_nodes` failures.** `contextlib.suppress`
+      hid backend rejection, letting old chunks accumulate on updates.
+      Now logs at WARNING with backend + count. (`b05bf54`)
+- [x] P7.3 **Double-close on serve shutdown.** SIGTERM + `finally` both
+      called `idx.close()`, second call re-took the writer lock for up
+      to 60 s. Guarded by `self._closed`. (`b05bf54`)
+- [x] P7.4 **Semantic splitter aborts sync.** Stage-1 `except ReadError`
+      was too narrow — `SemanticSplitterNodeParser` calls embed at chunk
+      time, `EmbedError` used to kill the whole sync. Widened. (`b05bf54`)
+- [x] P7.5 **BM25 empty with LanceDB default.** LanceDB stores text
+      itself, so the docstore was empty and BM25 fell back to zero hits
+      (hybrid was silently dense-only). `VectorStoreIndex(...,
+      store_nodes_override=True)` populates the docstore. (`e33d00c`)
+- [x] P7.6 **`_RWLock` naming/no-op reader methods.** Renamed to
+      `_WriterLock`, dropped `acquire_shared`/`release`. (`e33d00c`)
+- [x] P7.7 **Chunked sync w/ per-chunk checkpoints.** `sync()` used to
+      stage every file then run one giant `insert_nodes(all_nodes)`. A
+      mid-sync kill lost the whole run. Now iterates
+      `config.sync.files_per_chunk` (default 25) chunks; each chunk
+      persists store + manifest before the next. (`1ef036b`)
+- [x] P7.8 **Structured progress events under `--json`.** `stage_progress`
+      / `write_phase_starting` / `chunk_committed` log events every 25
+      files / per chunk, so a `--json` run is no longer opaque. (`1ef036b`)
+- [x] P7.9 **Skip recent-error files.** `_plan_sync` skips entries with
+      a `last_error_at` within `config.sync.retry_error_after_hours`
+      (default 24 h). Applies to any sync (not just `--full`) since the
+      watcher-loop retry storm was on incremental syncs. `--retry-errors`
+      bypasses. (`1ef036b`, tightened in `39bc394`)
+- [x] P7.10 **Per-file read timeout.** `readers.read(path,
+      timeout_sec=...)` wraps the reader in `SIGALRM` on Unix
+      main-thread callers; `config.files.read_timeout_sec` default 60 s.
+      Worker-thread / Windows paths get a documented no-op. (`1ef036b`)
+- [x] P7.11 **Tolerant PDF read via pymupdf.** pypdf spun for minutes in
+      recovery loops on truncated / malformed PDFs. pymupdf handles the
+      same files in seconds; promoted to a core dep, tried first,
+      pypdf as fallback. (`5136074`, `39bc394`)
+- [x] P7.12 **Reader metadata leaks into LanceDB schema.** An early
+      pymupdf commit added `"pdf_backend": ...` to the returned meta
+      dict, which propagated into the vector store schema — LanceDB
+      then rejected inserts on existing tables ("field pdf_backend does
+      not exist"). Backend selection is diagnostic-only; dropped from
+      metadata. (`0ef90c5`)
+- [x] P7.13 **Watcher retry loop w/o backoff.** A single broken PDF kept
+      firing `sync_failed` every debounce (~3 s), 24/7. Added
+      exponential backoff (`_BACKOFF_BASE_SEC=1`, `_BACKOFF_MAX_SEC=300`),
+      resets on success. (`39bc394`)
+- [x] P7.14 **pypdf logger noise not silenced.** `logging.getLogger("pypdf")
+      .setLevel(ERROR)` in `readers.py` was reset by structlog init.
+      Moved into `logging.setup()`, added `warnings.filterwarnings` for
+      the `warnings.warn` path. (`39bc394`)
+- [x] P7.15 **`LanceDB` fresh connect per `_count_rows`.** Cached the
+      read-only lancedb connection on `LanceStore._ro_conn` (only used
+      before the vector store opens its own table). (`e707d91`)
+- [x] P7.16 **Unstable `index_id` → multi-index storage.** Every
+      `VectorStoreIndex(nodes=..., storage_context=ctx)` minted a fresh
+      UUID index_id and persisted it; partial syncs left three UUID
+      stubs in `index_store.json`; `load_index_from_storage` failed
+      with "Expected to load a single index, but got N". Pinned
+      `_INDEX_ID = "ragwatcher"` on construction. Legacy migration path
+      picks the largest index at load, deletes the stubs, re-tags with
+      `_INDEX_ID`, and persists under the writer lock. (`d09d390`)
+
+**Deferred with `ponytail:` markers in code** (not incident-blocking):
+
+- BM25 O(N) rebuild on every sync — cheap up to ~10 k nodes, hurts past
+  ~500 k. Swap for an on-disk BM25 index if that measures.
+- Persist runs under the exclusive writer lock — LanceDB persist is fast;
+  split the lock (exclusive for insert/delete, release before persist)
+  if a slower backend lands.
+- `rebuild-docstore` CLI: pre-fix stores have an empty docstore + full
+  vector store; today `--full` fixes them by re-embedding everything.
+  Add a docstore-backfill from the vector store if the re-embed cost is
+  ever real.
+
+**Non-goals for P7.** Multi-process writers, atime-based watcher
+suppression, per-file read timeout on worker threads (needs a
+`threading.Timer` fallback for the watcher-driven syncs), Windows
+SIGALRM equivalent.
+
+---
+
 ## Part D — Non-todos (deliberately deferred)
 
 - Auth / multi-tenant / RBAC.
