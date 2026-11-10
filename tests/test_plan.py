@@ -96,6 +96,7 @@ def test_full_skips_recent_error_files(tiny_dir: Path):
             chunk_count=1,
             last_error={"type": "ReadError", "message": "boom"},
             last_error_at=datetime.now(UTC).isoformat(),
+            last_error_sha256=sha256_file(target),
         )
 
         plan = idx._plan_sync(full=True)
@@ -111,7 +112,7 @@ def test_incremental_also_skips_recent_error_files(tiny_dir: Path):
     pinned the service at 99% CPU on a truncated PDF."""
     from datetime import UTC, datetime
 
-    from ragwatcher.manifest import FileEntry
+    from ragwatcher.manifest import FileEntry, sha256_file
 
     settings = Settings()
     with RagIndex(tiny_dir, settings) as idx:
@@ -124,10 +125,16 @@ def test_incremental_also_skips_recent_error_files(tiny_dir: Path):
             chunk_count=1,
             last_error={"type": "ReadError", "message": "boom"},
             last_error_at=datetime.now(UTC).isoformat(),
+            last_error_sha256=sha256_file(target),
         )
 
         plan = idx._plan_sync(full=False)
         assert target not in plan.update, "incremental must skip recent-error too"
+
+        # Content edited since the error → retried even inside the window.
+        target.write_text(target.read_text() + "\nfixed\n")
+        plan = idx._plan_sync(full=False)
+        assert target in plan.update, "edited file must be retried"
 
 
 def test_full_reincludes_stale_error_files(tiny_dir: Path):

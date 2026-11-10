@@ -259,7 +259,7 @@ def index_cmd(
         bool,
         typer.Option(
             "--retry-errors",
-            help="Re-attempt files with a recent last_error on --full (default: skip).",
+            help="Re-attempt unchanged files with a recent last_error (default: skip).",
         ),
     ] = False,
 ) -> None:

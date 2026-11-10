@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from ragwatcher.errors import SchemaMismatch
+from ragwatcher.readers import META_DEFAULTS
 
 CURRENT_SCHEMA = 1
 
@@ -28,6 +29,9 @@ class FileEntry:
     chunk_count: int = 0
     last_error: dict[str, str] | None = None
     last_error_at: str | None = None
+    # File sha256 when the error was recorded; recent-error skip only
+    # applies while content is unchanged.
+    last_error_sha256: str | None = None
     context_hashes: list[str] | None = None
 
 
@@ -81,7 +85,7 @@ class Manifest:
     def check_fingerprint(self, current: dict[str, Any]) -> None:
         if _fp_bytes(self.config_fingerprint) != _fp_bytes(current):
             raise SchemaMismatch(
-                "config fingerprint drift; run `ragwatcher index --full` or `purge`"
+                "config fingerprint drift; run `ragwatcher purge <dir> --yes`, then re-index"
             )
 
 
@@ -155,6 +159,7 @@ def build_fingerprint(cfg: Any) -> dict[str, Any]:
         ),
         "chunk_semantic_buffer_size": (ch.semantic.buffer_size if semantic else None),
         "store_backend": cfg.store.backend,
+        "metadata_keys": sorted(META_DEFAULTS),
         "context_enabled": ctx_enabled,
         "context_prompt_sha256": (
             hashlib.sha256(ctx_prompt.encode()).hexdigest() if ctx_enabled and ctx_prompt else None

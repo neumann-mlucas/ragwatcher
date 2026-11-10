@@ -92,9 +92,9 @@ class SyncCfg(BaseModel):
     # and resumability at the cost of a few more persist calls. 25 amortizes
     # persist overhead on FastEmbed while capping worst-case rollback.
     files_per_chunk: int = 25
-    # Skip files whose last_error is fresher than this on --full, unless
-    # --retry-errors is passed. Prevents a broken PDF from re-costing the
-    # entire embed budget every rescan.
+    # On any sync, skip files whose last_error is fresher than this and whose
+    # content is unchanged since, unless --retry-errors is passed. Prevents a
+    # broken PDF from re-costing the entire embed budget every rescan.
     retry_error_after_hours: int = 24
 
 

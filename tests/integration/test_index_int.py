@@ -98,3 +98,59 @@ def test_query_debug_shape(notes_dir: Path) -> None:
         assert r.timings_ms.keys() >= {"retrieve", "rerank", "total"}
         if r.returned:
             assert r.returned[0].scores.keys() == {"dense", "bm25", "rrf", "rerank"}
+
+
+def test_delete_purges_docstore(notes_dir: Path) -> None:
+    """Regression: deletes only hit the vector store, so BM25 (built from the
+    docstore) kept serving text from deleted/updated files."""
+    with RagIndex(notes_dir, Settings()) as idx:
+        idx.sync()
+        (notes_dir / "alpha.md").unlink()
+        idx.sync()
+        docs = idx.store.storage_context().docstore.docs.values()
+        assert not any("alpha.md" in n.metadata.get("file_path", "") for n in docs)
+
+
+def test_lance_accepts_mixed_reader_metadata(notes_dir: Path) -> None:
+    """Regression: LanceDB pins metadata schema at first insert; a later CSV
+    (row_count) or headed md (heading_path) used to be rejected."""
+    for f in notes_dir.iterdir():
+        f.unlink()
+    (notes_dir / "plain.txt").write_text("plain text without any reader metadata\n")
+    with RagIndex(notes_dir, Settings()) as idx:
+        assert not idx.sync().errors
+        (notes_dir / "t.csv").write_text("a,b\n1,2\n")
+        (notes_dir / "h.md").write_text("# heading\n\nbody\n")
+        assert not idx.sync().errors
+
+
+def test_concurrent_writers_do_not_clobber(notes_dir: Path) -> None:
+    """Regression: two open indexes on one dir each saved stale in-memory
+    state over the other's writes."""
+    settings = Settings()
+    with RagIndex(notes_dir, settings) as a, RagIndex(notes_dir, settings) as b:
+        a.sync()
+        (notes_dir / "gamma.md").write_text("# gamma\n\ngamma body\n")
+        b.sync()
+    with RagIndex(notes_dir, settings) as c:
+        names = {Path(p).name for p in c.manifest.files}
+        assert names == {"alpha.md", "beta.md", "gamma.md"}, names
+        expected = sum(e.chunk_count for e in c.manifest.files.values())
+        assert c.store.persisted_node_count() == expected
+
+
+def test_simple_incremental_keeps_index_struct(notes_dir: Path) -> None:
+    """Regression: first sync per process built a fresh struct holding only
+    the new nodes and renamed it over the persisted one."""
+    settings = Settings()
+    settings.store.backend = "simple"
+    with RagIndex(notes_dir, settings) as idx:
+        idx.sync()
+    (notes_dir / "gamma.md").write_text("# gamma\n\ngamma body\n")
+    with RagIndex(notes_dir, settings) as idx:
+        idx.sync()
+    with RagIndex(notes_dir, settings) as idx:
+        r = idx.retrieve("what is alpha", top_k=3)
+        assert any("alpha.md" in h.source for h in r.returned)
+        expected = sum(e.chunk_count for e in idx.manifest.files.values())
+        assert len(idx._index_obj.index_struct.nodes_dict) == expected

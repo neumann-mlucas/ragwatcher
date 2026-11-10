@@ -32,6 +32,7 @@ def test_chunked_insert_persists_per_chunk(
     settings = Settings()
     # Force one file per chunk so we get a persist per file.
     settings.sync.files_per_chunk = 1
+    monkeypatch.setattr("ragwatcher.index._CHECKPOINT_SEC", 0.0)
     with RagIndex(notes_dir, settings) as idx:
         persist_calls = 0
         real_persist = idx.store.persist

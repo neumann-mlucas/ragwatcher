@@ -32,6 +32,9 @@ log = get_logger("index")
 # and `load_index_from_storage` failing with "Expected to load a single index".
 _INDEX_ID = "ragwatcher"
 
+# Min seconds between store+manifest checkpoints during a sync write phase.
+_CHECKPOINT_SEC = 30.0
+
 
 @dataclass
 class SyncPlan:
@@ -153,14 +156,9 @@ class RagIndex:
         self._index_obj: Any = None
         self._bm25: Any = None
         self._bm25_lock = threading.Lock()
-        # Flipped by sync() when a write phase actually runs. close() uses
-        # this to skip the exclusive-lock persist on read-only sessions —
-        # otherwise readers would stall up to _EXCLUSIVE_TIMEOUT_SEC waiting
-        # on a competing writer just to redo work sync() already did.
-        self._dirty = False
-        # Guards against double-close (signal handler + finally in cli.serve).
-        # Second close would re-take the writer lock, possibly waiting 60s.
-        self._closed = False
+        # (inode, mtime_ns) of manifest.json as of our last load/save; a
+        # different value under the writer lock means another process wrote.
+        self._manifest_sig: tuple[int, int] | None = None
 
     def __enter__(self) -> RagIndex:
         self._open()
@@ -170,28 +168,11 @@ class RagIndex:
         self.close()
 
     def close(self) -> None:
-        # sync() already persists + saves manifest under the exclusive lock.
-        # Only re-persist here if this session actually mutated state; a
-        # read-only session must not contend for the writer lock (would stall
-        # up to _EXCLUSIVE_TIMEOUT_SEC against a live writer).
-        if self._closed:
-            return
-        self._closed = True
-        if not self._dirty:
-            return
-        try:
-            with self._write_lock, self._lock.exclusive():
-                assert self.store is not None and self.manifest is not None
-                try:
-                    self.store.persist()
-                    self._check_store_invariant()
-                    manifest.save(self.persist_dir / "manifest.json", self.manifest)
-                except StoreError as e:
-                    log.warning("persist_failed", extra={"err": str(e)})
-        except LockHeld:
-            # Another writer holds exclusive; sync() already wrote the latest
-            # good state, losing this redundant re-persist is OK.
-            log.warning("close_persist_skipped_lock_timeout")
+        # Nothing to flush: sync() checkpoints store + manifest under the
+        # writer lock before returning. Re-persisting here would overwrite
+        # other processes' writes with stale state, and taking the lock from
+        # a signal handler that interrupted sync() on this thread deadlocks.
+        return None
 
     def _open(self) -> None:
         from llama_index.core import Settings as LISettings
@@ -199,11 +180,15 @@ class RagIndex:
 
         LISettings.embed_model = embed.get_embedding(self.config.embed)
         LISettings.llm = MockLLM()  # retrieval only; avoids "LLM disabled" stdout warning
+        self._load_state()
 
+    def _load_state(self) -> None:
         self.store = make_store(self.config.store, self.persist_dir)
         fp = build_fingerprint(self.config)
 
-        m = manifest.load(self.persist_dir / "manifest.json")
+        mpath = self.persist_dir / "manifest.json"
+        m = manifest.load(mpath)
+        self._manifest_sig = _file_sig(mpath)
         if m is None:
             self.manifest = Manifest.new(fp)
         else:
@@ -233,11 +218,27 @@ class RagIndex:
         assert self.manifest is not None and self.store is not None
         t0 = time.monotonic()
         plan = self._plan_sync(full=full, retry_errors=retry_errors)
-        errors: dict[str, str] = {}
-
         if dry_run or plan.is_noop():
             return SyncResult(plan=plan, errors={}, duration_ms=int((time.monotonic() - t0) * 1000))
 
+        # Everything below mutates store + manifest: serialize across threads
+        # (in-process lock) and processes (flock). Another process may have
+        # written since we loaded, so reload + re-plan under the lock —
+        # writing back our stale in-memory state would clobber theirs.
+        with self._write_lock, self._lock.exclusive():
+            if self._reload_if_stale():
+                plan = self._plan_sync(full=full, retry_errors=retry_errors)
+                if plan.is_noop():
+                    return SyncResult(
+                        plan=plan, errors={}, duration_ms=int((time.monotonic() - t0) * 1000)
+                    )
+            errors = self._apply_plan(plan, show_progress)
+        return SyncResult(plan=plan, errors=errors, duration_ms=int((time.monotonic() - t0) * 1000))
+
+    def _apply_plan(self, plan: SyncPlan, show_progress: bool) -> dict[str, str]:
+        """Stage + embed + commit `plan`. Caller holds both writer locks."""
+        assert self.manifest is not None and self.store is not None
+        errors: dict[str, str] = {}
         targets = plan.add + plan.update
         progress = _maybe_progress(len(targets)) if show_progress else None
         total = len(targets)
@@ -274,6 +275,7 @@ class RagIndex:
         # doesn't kick off in silence.
         node_est = sum(len(nodes) for _, nodes, _ in staged)
         chunk_size = self.config.sync.files_per_chunk
+        pending = [staged[i : i + chunk_size] for i in range(0, len(staged), chunk_size)]
         log.info(
             "write_phase_starting",
             extra={
@@ -281,107 +283,108 @@ class RagIndex:
                 "nodes_est": node_est,
                 "delete_files": len(plan.delete),
                 "files_per_chunk": chunk_size,
-                "chunks": (len(staged) + chunk_size - 1) // chunk_size if staged else 0,
+                "chunks": len(pending),
             },
         )
 
-        # Write phase — serialize across processes (cross-proc exclusive
-        # upgrade) and threads (in-process lock). Everything below mutates
-        # store + manifest; readers must not observe torn state.
-        with self._write_lock, self._lock.exclusive():
-            successful_files = 0
-            chunks_total = (len(staged) + chunk_size - 1) // chunk_size if staged else 0
-            for ci in range(0, len(staged), chunk_size):
-                chunk = staged[ci : ci + chunk_size]
-                chunk_idx = ci // chunk_size + 1
-                chunk_nodes = [n for _, nodes, _ in chunk for n in nodes]
-                try:
-                    self._insert_chunk(chunk_nodes)
-                except Exception as e:
-                    # Rollback partial inserts (node IDs stable, delete-by-id
-                    # idempotent) so the store never holds orphans that would
-                    # trip _check_store_invariant.
-                    self._delete_doc_ids([n.node_id for n in chunk_nodes])
-                    for p, _nodes, _entry in chunk:
-                        errors[str(p)] = f"batch embed failed: {e}"
-                        self._record_error(p, EmbedError(str(e)))
+        successful_files = 0
+        uncommitted = False
+        last_ckpt = time.monotonic()
+        while pending:
+            chunk = pending.pop(0)
+            chunk_nodes = [n for _, nodes, _ in chunk for n in nodes]
+            try:
+                self._insert_chunk(chunk_nodes)
+            except Exception as e:
+                # Rollback partial inserts so the store never holds orphans.
+                self._delete_doc_ids([n.node_id for n in chunk_nodes])
+                if len(chunk) > 1:
+                    # Retry file by file: one bad file must not stamp
+                    # last_error on every file it shared a batch with.
                     log.warning(
-                        "chunk_embed_failed",
-                        extra={
-                            "err": str(e),
-                            "chunk": chunk_idx,
-                            "chunks_total": chunks_total,
-                            "files": len(chunk),
-                        },
+                        "chunk_embed_failed_retry_per_file",
+                        extra={"err": str(e), "files": len(chunk)},
                     )
+                    pending[:0] = [[f] for f in chunk]
                     continue
+                p = chunk[0][0]
+                errors[str(p)] = f"embed failed: {e}"
+                self._record_error(p, EmbedError(str(e)))
+                log.warning("file_embed_failed", extra={"file": str(p), "err": str(e)})
+                continue
 
-                # Chunk succeeded: drop old chunks for updates, replace the
-                # manifest entries, persist store + manifest. Checkpointing
-                # per chunk means a mid-sync kill loses at most one chunk of
-                # work, not the whole run.
-                for p, _nodes, _entry in chunk:
-                    old = self.manifest.files.get(str(p))
-                    if old and old.doc_ids:
-                        self._delete_doc_ids(old.doc_ids)
-                for p, nodes, entry in chunk:
-                    self.manifest.files[str(p)] = entry
-                    log.info("file_embedded", extra={"file": str(p), "chunks": len(nodes)})
-                    successful_files += 1
+            # Chunk succeeded: drop old chunks for updates, replace the
+            # manifest entries.
+            for p, _nodes, _entry in chunk:
+                old = self.manifest.files.get(str(p))
+                if old and old.doc_ids:
+                    self._delete_doc_ids(old.doc_ids)
+            for p, nodes, entry in chunk:
+                self.manifest.files[str(p)] = entry
+                log.info("file_embedded", extra={"file": str(p), "chunks": len(nodes)})
+                successful_files += 1
+            uncommitted = True
 
-                # ponytail: persist runs inside the exclusive writer lock,
-                # so concurrent writers wait up to _EXCLUSIVE_TIMEOUT_SEC.
-                # LanceDB persist is fast; if a slower backend lands, split
-                # the lock (exclusive for insert/delete, release before
-                # persist) so writer contention doesn't stall on I/O.
-                self.store.persist()
-                self._check_store_invariant()
-                manifest.save(self.persist_dir / "manifest.json", self.manifest)
-                self._dirty = True
+            # Checkpoint on a time cadence, not per chunk: persist rewrites
+            # the whole docstore/index_store JSON, so per-chunk is O(N^2).
+            # ponytail: a mid-sync kill can leave up to _CHECKPOINT_SEC of
+            # inserted Lance rows untracked by the manifest (re-added as
+            # duplicates next sync). Make node ids deterministic + upsert if
+            # that shows up in practice.
+            if time.monotonic() - last_ckpt >= _CHECKPOINT_SEC:
+                self._checkpoint()
+                uncommitted = False
+                last_ckpt = time.monotonic()
                 log.info(
                     "chunk_committed",
-                    extra={
-                        "chunk": chunk_idx,
-                        "chunks_total": chunks_total,
-                        "done_files": successful_files,
-                        "staged_files": len(staged),
-                    },
+                    extra={"done_files": successful_files, "staged_files": len(staged)},
                 )
 
-            # Deletions are cheap; do them once at the end and persist if
-            # any chunk-embed didn't already trigger a persist.
-            for path_str in plan.delete:
-                self._delete_file(path_str)
-            if plan.delete:
-                self.store.persist()
-                self._check_store_invariant()
-                manifest.save(self.persist_dir / "manifest.json", self.manifest)
-                self._dirty = True
-            elif errors and not self._dirty:
-                # Errors-only run: save manifest so last_error survives.
-                manifest.save(self.persist_dir / "manifest.json", self.manifest)
+        for path_str in plan.delete:
+            self._delete_file(path_str)
+        if uncommitted or plan.delete:
+            self._checkpoint()
+        elif errors:
+            # Errors-only tail: save manifest so last_error survives.
+            self._save_manifest()
 
-            if successful_files or plan.delete:
-                self._reset_retriever()
+        if successful_files or plan.delete:
+            self._reset_retriever()
+        return errors
 
-        return SyncResult(plan=plan, errors=errors, duration_ms=int((time.monotonic() - t0) * 1000))
+    def _checkpoint(self) -> None:
+        assert self.store is not None
+        self.store.persist()
+        self._check_store_invariant()
+        self._save_manifest()
+
+    def _save_manifest(self) -> None:
+        assert self.manifest is not None
+        path = self.persist_dir / "manifest.json"
+        manifest.save(path, self.manifest)
+        self._manifest_sig = _file_sig(path)
+
+    def _reload_if_stale(self) -> bool:
+        """Reload store + manifest if another process saved since we did.
+
+        Every writer saves the manifest right after persisting the store
+        (see _checkpoint), so the manifest's (inode, mtime) is the change
+        signal for both. Call under the exclusive lock.
+        """
+        if _file_sig(self.persist_dir / "manifest.json") == self._manifest_sig:
+            return False
+        log.info("reload_external_changes", extra={"persist_dir": str(self.persist_dir)})
+        self._load_state()
+        self._index_obj = None
+        self._reset_retriever()
+        return True
 
     def _insert_chunk(self, nodes: list[BaseNode]) -> None:
-        assert self.store is not None
-        if not nodes:
-            return
-        if self._index_obj is None:
-            self._index_obj = VectorStoreIndex(
-                nodes=nodes,
-                storage_context=self.store.storage_context(),
-                # Mirror nodes into the docstore even when the vector store
-                # owns the text (LanceDB does). Without this the docstore
-                # stays empty and BM25 falls back to zero hits.
-                store_nodes_override=True,
-            )
-            self._index_obj.set_index_id(_INDEX_ID)
-        else:
-            self._index_obj.insert_nodes(nodes)
+        if nodes:
+            # Always insert into the loaded/persisted index. Building a fresh
+            # VectorStoreIndex here would replace the persisted struct with
+            # one holding only these nodes.
+            self._ensure_retriever().insert_nodes(nodes)
 
     def _plan_sync(self, full: bool, retry_errors: bool = False) -> SyncPlan:
         assert self.manifest is not None
@@ -398,14 +401,17 @@ class RagIndex:
                 continue
 
             # Skip repeat-broken files on any sync unless the caller asked
-            # to retry. Without this a single unreadable file (or a
-            # truncated PDF whose mtime bumps under a sync tool) re-consumes
-            # the whole embed budget every rescan AND, worse, keeps the
-            # watcher in a tight retry loop.
+            # to retry, but only while content is unchanged since the error.
+            # Without this a single unreadable file (or a truncated PDF whose
+            # mtime bumps under a sync tool) re-consumes the whole embed
+            # budget every rescan and keeps the watcher in a retry loop. An
+            # edited file is always retried.
             if (
                 not retry_errors
                 and entry.last_error
+                and entry.last_error_sha256
                 and _error_is_recent(entry.last_error_at, cutoff_hours)
+                and sha256_file(p) == entry.last_error_sha256
             ):
                 skipped_recent_errors += 1
                 continue
@@ -472,7 +478,9 @@ class RagIndex:
             "size": st.st_size,
             "sha256": digest,
         }
-        base_meta.update(meta)
+        # Fixed key set: LanceDB pins the metadata struct schema at first
+        # insert and rejects later rows carrying a new key.
+        base_meta.update({k: meta.get(k, d) for k, d in readers.META_DEFAULTS.items()})
         prefixed = chunking.prefix_metadata(base_meta, text)
         doc = Document(text=prefixed, metadata=base_meta, doc_id=digest)
 
@@ -502,12 +510,21 @@ class RagIndex:
         # doc_ids are node_ids (see _stage_file). vs.delete() takes ref_doc_id
         # (=Document.doc_id=sha256), which never matches; delete_nodes() is the
         # right API and both SimpleVectorStore and LanceDBVectorStore support it.
+        # Also drop them from the docstore (BM25 source) and index struct —
+        # store_nodes_override mirrors every node there.
+        # Not VectorStoreIndex.delete_nodes: its struct delete raises KeyError
+        # on ids never inserted (rollback path), skipping the docstore cleanup.
         assert self.store is not None
         if not doc_ids:
             return
-        vs = self.store.vector_store()
         try:
-            vs.delete_nodes(doc_ids)
+            idx = self._ensure_retriever()
+            self.store.vector_store().delete_nodes(doc_ids)
+            ctx = self.store.storage_context()
+            for nid in doc_ids:
+                idx.index_struct.nodes_dict.pop(nid, None)
+                ctx.docstore.delete_document(nid, raise_error=False)
+            ctx.index_store.add_index_struct(idx.index_struct)
         except Exception as e:
             # Loud, not silent: silent no-op here is the exact class of bug
             # (`vs.delete` mismatch) that let old chunks accumulate for months.
@@ -526,6 +543,10 @@ class RagIndex:
         )
         entry.last_error = {"type": type(exc).__name__, "message": str(exc)}
         entry.last_error_at = datetime.now(UTC).isoformat()
+        try:
+            entry.last_error_sha256 = sha256_file(path)
+        except OSError:
+            entry.last_error_sha256 = None
 
     # ---------------- retrieve ----------------
 
@@ -556,15 +577,17 @@ class RagIndex:
         try:
             # Explicit index_id: from the second sync forward the store has
             # exactly one index under `_INDEX_ID`, so this is a single load.
-            self._index_obj = load_index_from_storage(ctx, index_id=_INDEX_ID)
+            self._index_obj = load_index_from_storage(
+                ctx, index_id=_INDEX_ID, store_nodes_override=True
+            )
         except ValueError:
             # Legacy path: older persist accumulated per-sync UUID index
-            # stubs (see _INDEX_ID note). Pick the one with the most nodes,
-            # discard the others by re-persisting under _INDEX_ID.
+            # stubs (see _INDEX_ID note), each owning a slice of the nodes.
+            # Merge them into the largest, drop the rest, re-tag _INDEX_ID.
             from llama_index.core import load_indices_from_storage
 
             try:
-                loaded = load_indices_from_storage(ctx)
+                loaded = load_indices_from_storage(ctx, store_nodes_override=True)
             except (ValueError, KeyError) as e:
                 raise StoreError(
                     f"failed to load index from {self.persist_dir}: {e}. "
@@ -579,6 +602,7 @@ class RagIndex:
             for idx in loaded:
                 if idx is best:
                     continue
+                best.index_struct.nodes_dict.update(idx.index_struct.nodes_dict)
                 old_id = idx.index_struct.index_id
                 try:
                     ctx.index_store.delete_index_struct(old_id)
@@ -586,15 +610,9 @@ class RagIndex:
                 except Exception as e:
                     log.warning("index_stub_drop_failed", extra={"id": old_id, "err": str(e)})
             best.set_index_id(_INDEX_ID)
-            # Persist so the next process open sees a single index and takes
-            # the fast path. Best-effort — a read-only session that can't
-            # take the writer lock still works via the in-memory migration.
-            try:
-                with self._write_lock, self._lock.exclusive():
-                    self.store.persist()
-                    self._dirty = True
-            except LockHeld:
-                log.warning("index_migration_persist_skipped_lock_held")
+            # Not persisted here: this also runs inside sync()'s write lock
+            # (non-reentrant). The next sync checkpoint persists it; until
+            # then each open redoes this cheap in-memory migration.
             log.info(
                 "index_migrated_to_stable_id",
                 extra={
@@ -803,6 +821,14 @@ class RagIndex:
                 }
             )
         return out
+
+
+def _file_sig(path: Path) -> tuple[int, int] | None:
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        return None
+    return (st.st_ino, st.st_mtime_ns)
 
 
 def _error_is_recent(last_error_at: str | None, cutoff_hours: int) -> bool:

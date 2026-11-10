@@ -24,6 +24,11 @@ log = get_logger("readers")
 
 Reader = Callable[[Path], tuple[str, dict[str, Any]]]
 
+# Every reader-emitted metadata key with its typed default. index.py stamps
+# all of them on every node (LanceDB pins the metadata schema at first
+# insert). New key → add here; it's part of the config fingerprint.
+META_DEFAULTS: dict[str, Any] = {"heading_path": "", "page_count": 0, "row_count": 0}
+
 
 def _plain(path: Path) -> tuple[str, dict[str, Any]]:
     try:
@@ -33,7 +38,7 @@ def _plain(path: Path) -> tuple[str, dict[str, Any]]:
 
 
 def _pdf(path: Path) -> tuple[str, dict[str, Any]]:
-    # pymupdf (from the [pdf-pro] extra) tolerates malformed xref tables,
+    # pymupdf (optional [pdf-pro] extra, AGPL) tolerates malformed xref tables,
     # escaped strings, and truncated dicts that make pypdf spin in recovery
     # loops for minutes on a corrupt file. Try it first; fall back to pypdf
     # so a missing extra keeps the default install working.
